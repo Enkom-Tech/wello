@@ -1,9 +1,10 @@
 // Copyright 2025 the Vello Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-use criterion::{Criterion, black_box};
+use criterion::Criterion;
 use rand::rngs::SmallRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
+use std::hint::black_box;
 use vello_common::multi_atlas::Atlas;
 use vello_common::multi_atlas::AtlasId;
 

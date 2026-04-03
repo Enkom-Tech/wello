@@ -48,12 +48,12 @@ kurbo = { workspace = true, optional = true, default-features = true }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 # We use android_logger on Android
-env_logger = "0.11.9"
+env_logger = "0.11.10"
 
 [target.'cfg(not(any(target_arch = "wasm32", target_os = "android")))'.dependencies]
 vello = { workspace = true, features = ["hot_reload"] }
 vello_shaders = { workspace = true, features = ["compile"] }
-notify-debouncer-full = "0.5.0"
+notify-debouncer-full = "0.7.0"
 
 
 [target.'cfg(target_os = "android")'.dependencies]
@@ -68,18 +68,18 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 profiling = { version = "1.0.17", features = ["profile-with-tracing"] }
 
 # For caching
-jni = "0.21.1"
+jni = "0.22.4"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 console_error_panic_hook = { workspace = true }
 console_log = { workspace = true }
-wasm-bindgen-futures = "0.4.64"
-web-sys = { version = "0.3.91", features = ["HtmlCollection", "Text"] }
+wasm-bindgen-futures = "0.4.67"
+web-sys = { version = "0.3.94", features = ["HtmlCollection", "Text"] }
 web-time = { workspace = true }
 # If updating, also update in .github/workflows/web-demo.yml
-wasm-bindgen = "=0.2.114"
+wasm-bindgen = "=0.2.117"
 
 [target.wasm32-unknown-unknown.dependencies]
 # We have a transitive dependency on getrandom and it does not automatically
 # support wasm32-unknown-unknown. We need to enable the js feature.
-getrandom = { version = "0.3.4", features = ["wasm_js"] }
+getrandom = { version = "0.4.2", features = ["wasm_js"] }

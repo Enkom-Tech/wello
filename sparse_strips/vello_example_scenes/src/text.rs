@@ -105,7 +105,7 @@ impl TextScene {
         };
 
         let mut builder = layout_cx.ranged_builder(&mut font_cx, text, 1.0, true);
-        builder.push_default(FontFamily::parse("Roboto").unwrap());
+        builder.push_default(FontFamily::named("Roboto"));
         builder.push_default(StyleProperty::LineHeight(
             parley::LineHeight::FontSizeRelative(1.3),
         ));
@@ -114,7 +114,7 @@ impl TextScene {
         let mut layout: Layout<ColorBrush> = builder.build(text);
         let max_advance = Some(400.0);
         layout.break_all_lines(max_advance);
-        layout.align(max_advance, Alignment::Middle, AlignmentOptions::default());
+        layout.align(max_advance, Alignment::Center, AlignmentOptions::default());
 
         Self {
             layout,
@@ -268,7 +268,7 @@ fn render_glyph_run(
         run_x += glyph.advance;
 
         Glyph {
-            id: glyph.id as u32,
+            id: glyph.id,
             x: glyph_x,
             y: glyph_y,
         }
@@ -301,7 +301,7 @@ fn render_glyph_run_record(
         run_x += glyph.advance;
 
         Glyph {
-            id: glyph.id as u32,
+            id: glyph.id,
             x: glyph_x,
             y: glyph_y,
         }

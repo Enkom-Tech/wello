@@ -11,7 +11,7 @@
 
 use std::cmp::Ordering;
 
-use rand::Rng;
+use rand::RngExt;
 use rand::seq::IndexedRandom;
 use vello::Scene;
 use vello::kurbo::{Affine, BezPath, CubicBez, Line, ParamCurve, PathSeg, Point, QuadBez, Stroke};

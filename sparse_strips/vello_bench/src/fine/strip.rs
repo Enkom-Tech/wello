@@ -5,7 +5,7 @@ use crate::SEED;
 use crate::fine::default_blend;
 use criterion::{Bencher, Criterion};
 use rand::prelude::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use vello_common::coarse::WideTile;
 use vello_common::color::palette::css::ROYAL_BLUE;
 use vello_common::encode::EncodedPaint;

@@ -124,7 +124,7 @@ mod impls {
 
     use crate::SceneParams;
     use kurbo::RoundedRect;
-    use rand::Rng;
+    use rand::RngExt;
     use rand::{SeedableRng, rngs::StdRng};
     use vello::kurbo::{
         Affine, BezPath, Cap, Circle, Ellipse, Join, PathEl, Point, Rect, Shape, Stroke, Vec2,

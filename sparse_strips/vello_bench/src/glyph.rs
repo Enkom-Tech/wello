@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use criterion::Criterion;
 use parley::{
-    Alignment, AlignmentOptions, Font, FontContext, FontFamily, GlyphRun, Layout, LayoutContext,
+    Alignment, AlignmentOptions, FontContext, FontData, FontFamily, GlyphRun, Layout, LayoutContext,
     PositionedLayoutItem,
 };
 use vello_common::fearless_simd::Level;
@@ -37,7 +37,7 @@ pub fn glyph(c: &mut Criterion) {
         let mut layout_cx = LayoutContext::new();
         let mut font_cx = FontContext::new();
         let mut builder = layout_cx.ranged_builder(&mut font_cx, text, scale, true);
-        builder.push_default(FontFamily::parse("Roboto").unwrap());
+        builder.push_default(FontFamily::named("Roboto"));
         let mut layout: Layout<Brush> = builder.build(text);
         let max_advance = Some(WIDTH as f32);
         layout.break_all_lines(max_advance);
@@ -117,7 +117,7 @@ struct GlyphBenchRenderer {
 
 impl GlyphBenchRenderer {
     /// Creates a builder for drawing a run of glyphs that have the same attributes.
-    fn glyph_run(&mut self, font: &Font) -> GlyphRunBuilder<'_, Self> {
+    fn glyph_run(&mut self, font: &FontData) -> GlyphRunBuilder<'_, Self> {
         GlyphRunBuilder::new(font.clone(), Affine::IDENTITY, self)
     }
 }
@@ -176,7 +176,7 @@ fn render_glyph_run(
         run_x += glyph.advance;
 
         Glyph {
-            id: glyph.id as u32,
+            id: glyph.id,
             x: glyph_x,
             y: glyph_y,
         }
