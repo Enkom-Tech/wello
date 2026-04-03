@@ -157,11 +157,21 @@ impl ApplicationHandler for SimpleVelloApp {
                     )
                     .expect("failed to render to surface");
 
-                // Get the surface's texture
-                let surface_texture = surface
-                    .surface
-                    .get_current_texture()
-                    .expect("failed to get surface texture");
+                let (surface_texture, reconfigure_after) =
+                    match surface.surface.get_current_texture() {
+                        wgpu::CurrentSurfaceTexture::Success(st) => (st, false),
+                        wgpu::CurrentSurfaceTexture::Suboptimal(st) => (st, true),
+                        wgpu::CurrentSurfaceTexture::Timeout
+                        | wgpu::CurrentSurfaceTexture::Occluded => return,
+                        wgpu::CurrentSurfaceTexture::Outdated
+                        | wgpu::CurrentSurfaceTexture::Lost => {
+                            surface
+                                .surface
+                                .configure(&device_handle.device, &surface.config);
+                            return;
+                        }
+                        wgpu::CurrentSurfaceTexture::Validation => return,
+                    };
 
                 // Perform the copy
                 let mut encoder =
@@ -181,6 +191,11 @@ impl ApplicationHandler for SimpleVelloApp {
                 device_handle.queue.submit([encoder.finish()]);
                 // Queue the texture to be presented on the surface
                 surface_texture.present();
+                if reconfigure_after {
+                    surface
+                        .surface
+                        .configure(&device_handle.device, &surface.config);
+                }
 
                 device_handle.device.poll(wgpu::PollType::Poll).unwrap();
             }

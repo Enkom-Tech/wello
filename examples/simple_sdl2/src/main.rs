@@ -84,10 +84,20 @@ fn main() {
             )
             .expect("failed to render to surface");
 
-        let surface_texture = surface
-            .surface
-            .get_current_texture()
-            .expect("failed to get surface texture");
+        let (surface_texture, reconfigure_after) = match surface.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(st) => (st, false),
+            wgpu::CurrentSurfaceTexture::Suboptimal(st) => (st, true),
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                continue;
+            }
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                surface
+                    .surface
+                    .configure(&device_handle.device, &surface.config);
+                continue;
+            }
+            wgpu::CurrentSurfaceTexture::Validation => continue,
+        };
 
         let mut encoder =
             device_handle
@@ -116,6 +126,11 @@ fn main() {
         }
 
         surface_texture.present();
+        if reconfigure_after {
+            surface
+                .surface
+                .configure(&device_handle.device, &surface.config);
+        }
     }
 }
 

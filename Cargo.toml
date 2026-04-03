@@ -1,5 +1,5 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
     "vello",
     "vello_encoding",
@@ -134,8 +134,8 @@ vello_dev_macros = { path = "sparse_strips/vello_dev_macros" }
 
 # NOTE: The wgpu and naga versions should be kept in sync, and make sure to keep this
 # in sync with the version badge in README.md and vello/README.md
-wgpu = { version = "28.0.0", default-features = false, features = ["std", "wgsl"] }
-naga = { version = "28.0.0", default-features = false }
+wgpu = { version = "29.0.1", default-features = false, features = ["std", "wgsl"] }
+naga = { version = "29.0.1", default-features = false }
 log = "0.4.29"
 image = { version = "0.25.10", default-features = false }
 
@@ -144,7 +144,7 @@ clap = "4.6.0"
 anyhow = "1.0.102"
 pollster = "0.4.0"
 web-time = "1.1.0"
-wgpu-profiler = "0.26.0"
+wgpu-profiler = "0.27.0"
 winit = "0.30.13"
 scenes = { path = "examples/scenes" }
 svg = "0.18.0"

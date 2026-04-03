@@ -32,10 +32,9 @@ impl RendererWrapper {
     async fn new(canvas: HtmlCanvasElement) -> Self {
         let width = canvas.width();
         let height = canvas.height();
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::GL,
-            ..Default::default()
-        });
+        let mut instance_desc = wgpu::InstanceDescriptor::new_without_display_handle();
+        instance_desc.backends = wgpu::Backends::GL;
+        let instance = wgpu::Instance::new(instance_desc);
         let surface = instance
             .create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone()))
             .expect("Canvas surface to be valid");
@@ -174,7 +173,19 @@ impl AppState {
             height: self.height,
         };
 
-        let surface_texture = self.renderer_wrapper.surface.get_current_texture().unwrap();
+        let (surface_texture, reconfigure_after) =
+            match self.renderer_wrapper.surface.get_current_texture() {
+                wgpu::CurrentSurfaceTexture::Success(st) => (st, false),
+                wgpu::CurrentSurfaceTexture::Suboptimal(st) => (st, true),
+                wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                    return;
+                }
+                wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                    self.renderer_wrapper.resize(self.width, self.height);
+                    return;
+                }
+                wgpu::CurrentSurfaceTexture::Validation => return,
+            };
         let surface_texture_view = surface_texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -198,6 +209,9 @@ impl AppState {
 
         self.renderer_wrapper.queue.submit([encoder.finish()]);
         surface_texture.present();
+        if reconfigure_after {
+            self.renderer_wrapper.resize(self.width, self.height);
+        }
 
         self.need_render = false;
     }
@@ -573,7 +587,28 @@ pub async fn render_scene(scene: Scene, width: u16, height: u16) {
         width: width as u32,
         height: height as u32,
     };
-    let surface_texture = surface.get_current_texture().unwrap();
+    let (surface_texture, reconfigure_after) = match surface.get_current_texture() {
+        wgpu::CurrentSurfaceTexture::Success(st) => (st, false),
+        wgpu::CurrentSurfaceTexture::Suboptimal(st) => (st, true),
+        wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => return,
+        wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+            surface.configure(
+                &device,
+                &wgpu::SurfaceConfiguration {
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    width: width as u32,
+                    height: height as u32,
+                    present_mode: wgpu::PresentMode::Fifo,
+                    alpha_mode: wgpu::CompositeAlphaMode::Opaque,
+                    desired_maximum_frame_latency: 2,
+                    view_formats: vec![],
+                },
+            );
+            return;
+        }
+        wgpu::CurrentSurfaceTexture::Validation => return,
+    };
     let surface_texture_view = surface_texture
         .texture
         .create_view(&wgpu::TextureViewDescriptor::default());
@@ -594,4 +629,19 @@ pub async fn render_scene(scene: Scene, width: u16, height: u16) {
 
     queue.submit([encoder.finish()]);
     surface_texture.present();
+    if reconfigure_after {
+        surface.configure(
+            &device,
+            &wgpu::SurfaceConfiguration {
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                width: width as u32,
+                height: height as u32,
+                present_mode: wgpu::PresentMode::Fifo,
+                alpha_mode: wgpu::CompositeAlphaMode::Opaque,
+                desired_maximum_frame_latency: 2,
+                view_formats: vec![],
+            },
+        );
+    }
 }

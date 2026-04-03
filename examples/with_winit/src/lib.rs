@@ -633,10 +633,21 @@ impl ApplicationHandler<UserEvent> for VelloApp {
                 drop(render_span);
 
                 let texture_span = tracing::trace_span!("Blitting to surface").entered();
-                let surface_texture = surface
-                    .surface
-                    .get_current_texture()
-                    .expect("failed to get surface texture");
+                let (surface_texture, reconfigure_after) =
+                    match surface.surface.get_current_texture() {
+                        wgpu::CurrentSurfaceTexture::Success(st) => (st, false),
+                        wgpu::CurrentSurfaceTexture::Suboptimal(st) => (st, true),
+                        wgpu::CurrentSurfaceTexture::Timeout
+                        | wgpu::CurrentSurfaceTexture::Occluded => return,
+                        wgpu::CurrentSurfaceTexture::Outdated
+                        | wgpu::CurrentSurfaceTexture::Lost => {
+                            surface
+                                .surface
+                                .configure(&device_handle.device, &surface.config);
+                            return;
+                        }
+                        wgpu::CurrentSurfaceTexture::Validation => return,
+                    };
                 // Perform the copy
                 // (TODO: Does it improve throughput to acquire the surface after the previous texture render has happened?)
                 let mut encoder =
@@ -655,6 +666,11 @@ impl ApplicationHandler<UserEvent> for VelloApp {
                 );
                 device_handle.queue.submit([encoder.finish()]);
                 surface_texture.present();
+                if reconfigure_after {
+                    surface
+                        .surface
+                        .configure(&device_handle.device, &surface.config);
+                }
                 drop(texture_span);
 
                 {
