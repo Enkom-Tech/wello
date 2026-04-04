@@ -46,7 +46,7 @@ edition = "2024"
 # and with the MSRV in the `Unreleased` section of CHANGELOG.md.
 rust-version = "1.92"
 license = "Apache-2.0 OR MIT"
-repository = "https://github.com/linebender/vello"
+repository = "https://github.com/Enkom-Tech/wello"
 
 [workspace.lints]
 # LINEBENDER LINT SET - Cargo.toml - v7
@@ -166,3 +166,4 @@ serde_json = "1.0.149"
 inherits = "release"
 debug = true
 strip = "none"
+
