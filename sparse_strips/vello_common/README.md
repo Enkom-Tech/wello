@@ -24,8 +24,6 @@ See https://linebender.org/blog/doc-include/ for related discussion. -->
 
 [libm]: https://crates.io/crates/libm
 [crate::pixmap::Pixmap]: https://docs.rs/vello_common/latest/vello_common/pixmap/struct.Pixmap.html
-[`glyph`]: https://docs.rs/vello_common/latest/vello_common/glyph/index.html
-
 <!-- cargo-rdme start -->
 
 This crate includes common geometry representations, tiling logic, and other fundamental components used by both [Vello CPU][vello_cpu] and Vello Hybrid.
@@ -47,7 +45,6 @@ Vello does not use this crate.
 - `png` (enabled by default): Allow loading [`Pixmap`][crate::pixmap::Pixmap]s from PNG images.
   Also required for rendering glyphs with an embedded PNG.
   Implies `std`.
-- `text` (enabled by default): Enables glyph rendering (see the [`glyph`][] module).
 
 At least one of `std` and `libm` is required; `std` overrides `libm`.
 
@@ -65,7 +62,7 @@ This crate acts as a foundation for `vello_cpu` and `vello_hybrid`, providing es
 
 ## Minimum supported Rust Version (MSRV)
 
-This version of Vello Common has been verified to compile with **Rust 1.92** and later.
+This version of Vello Common has been verified to compile with **Rust 1.88** and later.
 
 Future versions of Vello Common might increase the Rust version requirement.
 It will not be treated as a breaking change and as such can even happen with small patch releases.

@@ -23,7 +23,6 @@
 //! - `png` (enabled by default): Allow loading [`Pixmap`][crate::pixmap::Pixmap]s from PNG images.
 //!   Also required for rendering glyphs with an embedded PNG.
 //!   Implies `std`.
-//! - `text` (enabled by default): Enables glyph rendering (see the [`glyph`][] module).
 //!
 //! At least one of `std` and `libm` is required; `std` overrides `libm`.
 //!
@@ -67,15 +66,12 @@ extern crate std;
 pub mod blurred_rounded_rect;
 pub mod clip;
 pub mod coarse;
-#[cfg(feature = "text")]
-pub mod colr;
 pub mod encode;
 pub mod filter;
 pub mod filter_effects;
 pub mod flatten;
 pub(crate) mod flatten_simd;
-#[cfg(feature = "text")]
-pub mod glyph;
+pub mod geometry;
 pub mod image_cache;
 pub mod mask;
 pub mod math;
@@ -85,9 +81,12 @@ pub mod paint;
 #[cfg(feature = "pico_svg")]
 pub mod pico_svg;
 pub mod pixmap;
-pub mod recording;
+#[doc(hidden)]
+#[cfg(feature = "probe")]
+pub mod probe;
 pub mod rect;
 pub mod render_graph;
+pub mod render_state;
 pub mod simd;
 pub mod strip;
 pub mod strip_generator;
@@ -98,3 +97,10 @@ pub use fearless_simd;
 pub use peniko;
 pub use peniko::color;
 pub use peniko::kurbo;
+
+/// A handle to an external, user-provided texture.
+///
+/// This is resolved at render time by passing in a mapping of handles to textures, but is
+/// otherwise opaque to the renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TextureId(pub u64);

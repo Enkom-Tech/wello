@@ -190,6 +190,7 @@ use vello_common::peniko::BlendMode;
 use vello_common::render_graph::{LayerId, RenderNodeKind};
 use vello_common::strip_generator::StripStorage;
 use vello_common::{
+    TextureId,
     coarse::{Cmd, WideTile},
     encode::EncodedPaint,
     paint::{ImageSource, Paint},
@@ -206,32 +207,46 @@ const PAINT_TYPE_IMAGE: u32 = 1;
 const PAINT_TYPE_LINEAR_GRADIENT: u32 = 2;
 const PAINT_TYPE_RADIAL_GRADIENT: u32 = 3;
 const PAINT_TYPE_SWEEP_GRADIENT: u32 = 4;
+const PAINT_TYPE_BLURRED_ROUNDED_RECT: u32 = 5;
 
 /// Bit 31 of [`GpuStrip::paint_and_rect_flag`] signals that the strip
 /// represents a full rectangle.
 const RECT_STRIP_FLAG: u32 = 1 << 31;
+/// The threshold of the rectangle size after which a rectangle should be split up
+/// into multiple smaller ones.
+const LARGE_RECT_SPLIT_THRESHOLD: u16 = 32;
 
 // The sentinel tile index representing the surface.
 const SENTINEL_SLOT_IDX: usize = usize::MAX;
 
-/// The output target for the main rendering operations within a round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OutputTarget {
-    /// Render to the final, user-provided output view/surface.
-    FinalView,
-    // TODO: This should also be used in the `render_to_atlas` method so that it works
-    // on devices with no native RGBA8.
-    /// Render to the intermediate texture associated with the given filter layer.
-    IntermediateTexture(LayerId),
+pub(crate) enum RootRenderTarget {
+    /// The root render target is the user-provided surface.
+    UserSurface,
+    /// The root render target is an atlas layer.
+    AtlasLayer,
 }
 
 /// Specifies the target for a strip render pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StripPassRenderTarget {
-    /// Render to the current output target.
-    Output(OutputTarget),
+    /// Render to the root output target.
+    Root(RootRenderTarget),
+    /// Render to a layer in the filter atlas.
+    FilterLayer(LayerId),
     /// Render to one of the slot textures used for clipping/blending.
     SlotTexture(u8),
+}
+
+/// Specifies a run of strips inside [`Draw`] that can be drawn with the same external texture
+/// binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExternalTextureRun {
+    pub(crate) texture_id: TextureId,
+
+    /// Start index of the strip range for this run. The end is implicitly the start of the next
+    /// run, or, for the last run, the total number of strips.
+    pub(crate) strips_start: usize,
 }
 
 /// Trait for abstracting the renderer backend from the scheduler.
@@ -239,10 +254,27 @@ pub(crate) trait RendererBackend {
     /// Clear specific slots in a texture.
     fn clear_slots(&mut self, texture_index: usize, slots: &[u32]);
 
-    /// Execute a render pass for strips.
+    /// Execute a render pass for strips, split into opaque and alpha passes.
+    ///
+    /// For output targets, render the strips in opaque then alpha order with:
+    ///
+    /// | Pass   | Depth Test       | Depth Write | Blend | Strip Ordering |
+    /// | ------ | ---------------- | ----------- | ----- | -------------- |
+    /// | Opaque | ON (`LessEqual`) | ON          | OFF   | Front-to-back  |
+    /// | Alpha  | ON (`LessEqual`) | OFF         | ON    | Back-to-front  |
+    ///
+    /// For slot textures, there are no opaque strips, so we only render the alpha strips with:
+    ///
+    /// | Pass   | Depth Test       | Depth Write | Blend | Strip Ordering |
+    /// | ------ | ---------------- | ----------- | ----- | -------------- |
+    /// | Alpha  | OFF              | OFF         | ON    | Back-to-front  |
+    ///
+    // TODO: Consider using opaque passes for non-output targets.
     fn render_strips(
         &mut self,
-        strips: &[GpuStrip],
+        opaque_strips: &[GpuStrip],
+        alpha_strips: &[GpuStrip],
+        external_texture_runs: &[ExternalTextureRun],
         target: StripPassRenderTarget,
         load_op: LoadOp,
     );
@@ -261,6 +293,13 @@ pub(crate) enum LoadOp {
     Clear,
 }
 
+#[derive(Clone, Copy)]
+struct ProcessedPaint {
+    payload: u32,
+    paint: u32,
+    external_texture_id: Option<TextureId>,
+}
+
 #[derive(Debug)]
 pub(crate) struct Scheduler {
     /// Index of the current round
@@ -277,7 +316,34 @@ pub(crate) struct Scheduler {
     /// the number of allocations.
     round_pool: RoundPool,
     /// The output target for the main rendering operations.
-    output_target: OutputTarget,
+    output_target: StripPassRenderTarget,
+    /// See [`DepthCounter`].
+    depth: DepthCounter,
+}
+
+/// Assigns z depth indices to GPU strips for early z rejection.
+///
+/// Because only opaque strips write to the depth buffer, only opaque
+/// strips require unique z values (so z must be incremented for each opaque).
+/// Alpha strips, however, can re-use whatever was the last z index since the
+/// GPU does a LEQUAL test only.
+#[derive(Debug, Default)]
+struct DepthCounter {
+    count: u32,
+}
+
+impl DepthCounter {
+    #[inline(always)]
+    fn reset(&mut self) {
+        self.count = 0;
+    }
+
+    /// Returns the next depth index for early z rejection.
+    #[inline(always)]
+    fn next(&mut self, opaque: bool) -> u32 {
+        self.count += opaque as u32;
+        self.count
+    }
 }
 
 #[derive(Debug, Default)]
@@ -340,12 +406,11 @@ impl Round {
 pub(crate) struct SchedulerState {
     /// The state of the current wide tile that is being processed.
     tile_state: TileState,
-}
-
-impl SchedulerState {
-    fn clear(&mut self) {
-        self.tile_state.clear();
-    }
+    /// The maximum round that has been allocated for any drawing operation
+    /// in any wide tile for the current filter/root layer.
+    ///
+    /// This value should be reset to the base round every time a new layer is processed.
+    max_round: usize,
 }
 
 /// State for a single wide tile.
@@ -431,16 +496,56 @@ impl TileEl {
 }
 
 #[derive(Debug, Default)]
-struct Draw(Vec<GpuStrip>);
+struct Draw {
+    /// Opaque strips: See `RendererBackend::render_strips` documentation.
+    opaque: Vec<GpuStrip>,
+    /// Alpha strips: See `RendererBackend::render_strips` documentation.
+    alpha: Vec<GpuStrip>,
+    /// Runs within [`Self::alpha`] that can be drawn with the same external texture binding.
+    external_texture_runs: Vec<ExternalTextureRun>,
+}
 
 impl Draw {
     #[inline(always)]
-    fn push(&mut self, gpu_strip: GpuStrip) {
-        self.0.push(gpu_strip);
+    fn push_opaque(&mut self, gpu_strip: GpuStrip) {
+        self.opaque.push(gpu_strip);
+    }
+
+    #[inline(always)]
+    fn push_alpha(&mut self, gpu_strip: GpuStrip, external_texture_id: Option<TextureId>) {
+        if let Some(texture_id) = external_texture_id {
+            // Runs are consecutive `GpuStrip`s that can be rendered with a single external texture.
+            // If the external texture changes, a new run is created. The first external texture
+            // encountered creates the first run, which is "retroactively" set to start from the
+            // first `GpuStrip`, such that it can be applied within the same draw call.
+            let needs_new_run = self
+                .external_texture_runs
+                .last()
+                .is_none_or(|run| run.texture_id != texture_id);
+            if needs_new_run {
+                let strips_start = if self.external_texture_runs.is_empty() {
+                    0
+                } else {
+                    self.alpha.len()
+                };
+                self.external_texture_runs.push(ExternalTextureRun {
+                    strips_start,
+                    texture_id,
+                });
+            }
+        }
+
+        self.alpha.push(gpu_strip);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.opaque.is_empty() && self.alpha.is_empty()
     }
 
     fn clear(&mut self) {
-        self.0.clear();
+        self.opaque.clear();
+        self.alpha.clear();
+        self.external_texture_runs.clear();
     }
 }
 
@@ -456,7 +561,8 @@ impl Scheduler {
             free,
             rounds_queue: VecDeque::new(),
             round_pool: RoundPool::default(),
-            output_target: OutputTarget::FinalView,
+            output_target: StripPassRenderTarget::Root(RootRenderTarget::UserSurface),
+            depth: DepthCounter::default(),
         }
     }
 
@@ -496,10 +602,12 @@ impl Scheduler {
         state: &mut SchedulerState,
         renderer: &mut R,
         scene: &Scene,
+        root_output_target: RootRenderTarget,
         paint_idxs: &[u32],
         filter_context: &FilterContext,
         encoded_paints: &[EncodedPaint],
     ) -> Result<(), RenderError> {
+        self.depth.reset();
         for node_id in scene.render_graph.execution_order() {
             let node = &scene.render_graph.nodes[node_id];
 
@@ -513,7 +621,7 @@ impl Scheduler {
                     wtile_bbox,
                     ..
                 } => {
-                    self.output_target = OutputTarget::IntermediateTexture(*layer_id);
+                    self.output_target = StripPassRenderTarget::FilterLayer(*layer_id);
                     self.process_filter_node(
                         state,
                         renderer,
@@ -526,7 +634,7 @@ impl Scheduler {
                     )?;
                 }
                 RenderNodeKind::RootLayer { .. } => {
-                    self.output_target = OutputTarget::FinalView;
+                    self.output_target = StripPassRenderTarget::Root(root_output_target);
                     self.process_root_node(
                         state,
                         renderer,
@@ -544,7 +652,7 @@ impl Scheduler {
 
             // This will actually apply the filter and store the filtered texture in the image
             // atlas
-            if let OutputTarget::IntermediateTexture(layer_id) = self.output_target {
+            if let StripPassRenderTarget::FilterLayer(layer_id) = self.output_target {
                 renderer.apply_filter(layer_id);
             }
         }
@@ -593,6 +701,9 @@ impl Scheduler {
         let rows = wide.height_tiles();
         let cols = wide.width_tiles();
         let num_tiles = (rows * cols) as usize;
+        // If we processed any filter layers previously, their maximum round should not leak
+        // into the root node.
+        state.max_round = self.round;
 
         // A bit hacky, but we need this since we still need mutable access to
         // self when processing everything.
@@ -606,6 +717,7 @@ impl Scheduler {
                 self.push_direct_strips(
                     scene,
                     0..scene.fast_strips_buffer.commands.len(),
+                    state.max_round,
                     paint_idxs,
                     encoded_paints,
                 );
@@ -634,6 +746,7 @@ impl Scheduler {
                         self.push_direct_strips(
                             scene,
                             prev_split..split,
+                            state.max_round,
                             paint_idxs,
                             encoded_paints,
                         );
@@ -662,6 +775,7 @@ impl Scheduler {
                     self.push_direct_strips(
                         scene,
                         prev_split..tail_end,
+                        state.max_round,
                         paint_idxs,
                         encoded_paints,
                     );
@@ -687,18 +801,23 @@ impl Scheduler {
         filter_context: &FilterContext,
         encoded_paints: &[EncodedPaint],
     ) -> Result<(), RenderError> {
+        // The maximum layer of other filter nodes should not leak into new filter nodes, hence
+        // we need to reset it.
+        state.max_round = self.round;
+
         for y in wtile_bbox.y0()..wtile_bbox.y1() {
             for x in wtile_bbox.x0()..wtile_bbox.x1() {
                 let wide_tile = scene.wide.get(x, y);
                 let wide_tile_x = x * WideTile::WIDTH;
                 let wide_tile_y = y * Tile::HEIGHT;
 
-                state.clear();
+                state.tile_state.clear();
                 self.initialize_tile_state(
                     &mut state.tile_state,
                     wide_tile,
                     wide_tile_x,
                     wide_tile_y,
+                    self.round,
                     encoded_paints,
                     paint_idxs,
                     // Background is only ever applied in the root layer.
@@ -740,33 +859,49 @@ impl Scheduler {
         &mut self,
         scene: &Scene,
         range: Range<usize>,
+        round: usize,
         paint_idxs: &[u32],
         encoded_paints: &[EncodedPaint],
     ) {
         let strip_storage = scene.strip_storage.borrow();
         // Always choose the draw of the final surface, since direct strips are only ever
         // rendered to the final surface.
-        let draw = self.draw_mut(self.round, 2);
+        let mut depth = core::mem::take(&mut self.depth);
+        // TODO: Also allow the split when rendering to an atlas layer.
+        let allow_opaque_split = self.is_rendering_to_user_surface();
+        let draw = self.draw_mut(round, 2);
 
         for cmd in &scene.fast_strips_buffer.commands[range] {
             match cmd {
                 FastStripCommand::Path(path) => {
+                    let is_opaque = Self::is_paint_opaque(&path.paint, encoded_paints);
+                    let depth_index = depth.next(is_opaque && allow_opaque_split);
                     generate_gpu_strips_for_fast_path(
                         path,
                         &strip_storage,
                         scene,
                         encoded_paints,
                         paint_idxs,
-                        &mut draw.0,
+                        depth_index,
+                        is_opaque && allow_opaque_split,
+                        draw,
                     );
                 }
                 FastStripCommand::Rect(r) => {
-                    let strip = pack_rectangle_into_gpu(r, encoded_paints, paint_idxs);
-
-                    draw.0.push(strip);
+                    let is_opaque = Self::is_paint_opaque(&r.paint, encoded_paints);
+                    let depth_index = depth.next(is_opaque && allow_opaque_split);
+                    pack_rectangle_into_gpu(
+                        r,
+                        encoded_paints,
+                        paint_idxs,
+                        depth_index,
+                        is_opaque && allow_opaque_split,
+                        draw,
+                    );
                 }
             }
         }
+        self.depth = depth;
     }
 
     /// Process one batch of coarse-rasterized wide tile commands.
@@ -806,7 +941,7 @@ impl Scheduler {
                 // first time (i.e. the start offset is 0).
                 let paint_bg = start_offset == 0;
 
-                state.clear();
+                state.tile_state.clear();
 
                 // This will also paint the background, if necessary.
                 self.initialize_tile_state(
@@ -814,6 +949,7 @@ impl Scheduler {
                     tile,
                     tile_x,
                     tile_y,
+                    state.max_round,
                     encoded_paints,
                     paint_idxs,
                     paint_bg,
@@ -834,6 +970,8 @@ impl Scheduler {
 
                 // Advance past the `BatchEnd` marker (if present).
                 cmd_offsets[idx] = (end + 1).min(tile.cmds.len());
+
+                state.max_round = state.max_round.max(state.tile_state.stack[0].round);
             }
         }
 
@@ -844,8 +982,8 @@ impl Scheduler {
     ///
     /// The rounds queue must not be empty.
     fn flush<R: RendererBackend>(&mut self, renderer: &mut R) {
-        let round = self.rounds_queue.pop_front().unwrap();
-        for (i, draw) in round.draws.iter().enumerate() {
+        let mut round = self.rounds_queue.pop_front().unwrap();
+        for (i, draw) in round.draws.iter_mut().enumerate() {
             #[cfg(debug_assertions)]
             {
                 // This is an expensive O(n²) debug only check that enforces that there are no
@@ -861,7 +999,7 @@ impl Scheduler {
                 }
             }
             let target = if i == 2 {
-                StripPassRenderTarget::Output(self.output_target)
+                self.output_target
             } else {
                 StripPassRenderTarget::SlotTexture(i as u8)
             };
@@ -881,7 +1019,7 @@ impl Scheduler {
                 }
             };
 
-            if draw.0.is_empty() {
+            if draw.is_empty() {
                 if load == LoadOp::Clear {
                     // There are no strips to render, so `render_strips` will not run and won't clear
                     // the texture. We still have slots to clear this round so explicitly clear
@@ -891,7 +1029,25 @@ impl Scheduler {
                 continue;
             }
 
-            renderer.render_strips(&draw.0, target, load);
+            if i == 2 {
+                // Output target: reverse opaque for front-to-back rendering.
+                // Alpha strips stay in natural back-to-front order.
+                let Draw {
+                    opaque,
+                    alpha,
+                    external_texture_runs,
+                } = draw;
+                // This leaves `opaque` in a dirty state, but it doesn't matter because we never use it again.
+                opaque.reverse();
+                renderer.render_strips(opaque, alpha, external_texture_runs, target, load);
+            } else {
+                // Slot textures: no depth optimization, everything in alpha list.
+                assert!(
+                    draw.opaque.is_empty(),
+                    "opaque pass unsupported for slot textures"
+                );
+                renderer.render_strips(&[], &draw.alpha, &draw.external_texture_runs, target, load);
+            }
         }
         for i in 0..2 {
             self.free[i].extend(&round.free[i]);
@@ -899,6 +1055,16 @@ impl Scheduler {
         self.round += 1;
 
         self.round_pool.return_to_pool(round);
+    }
+
+    /// Whether the scheduler is currently rendering to the final user surface
+    /// (as opposed to a filter layer or slot texture).
+    #[inline(always)]
+    fn is_rendering_to_user_surface(&self) -> bool {
+        matches!(
+            self.output_target,
+            StripPassRenderTarget::Root(RootRenderTarget::UserSurface)
+        )
     }
 
     // Find the appropriate draw call for rendering.
@@ -919,7 +1085,7 @@ impl Scheduler {
     }
 
     /// Render the tile's background color (set by overdraw elimination) to the
-    /// surface. Returns `true` if a strip was emitted.
+    /// surface.
     fn paint_tile_bg(
         &mut self,
         tile: &WideTile<MODE_HYBRID>,
@@ -931,18 +1097,24 @@ impl Scheduler {
         let bg = tile.bg.as_premul_rgba8().to_u32();
 
         if has_non_zero_alpha(bg) {
-            let (payload, paint) = Self::process_paint(
+            let processed = Self::process_paint(
                 &Paint::Solid(tile.bg),
                 encoded_paints,
                 (wide_tile_x, wide_tile_y),
                 idxs,
             );
 
+            let is_opaque = tile.bg.is_opaque();
+            let is_user_surface = self.is_rendering_to_user_surface();
+            let bg_depth_index = self.depth.next(is_opaque && is_user_surface);
             let draw = self.draw_mut(self.round, 2);
-            draw.push(
-                GpuStripBuilder::at_surface(wide_tile_x, wide_tile_y, WideTile::WIDTH)
-                    .paint(payload, paint),
-            );
+            let strip = GpuStripBuilder::at_surface(wide_tile_x, wide_tile_y, WideTile::WIDTH)
+                .paint(processed.payload, processed.paint, bg_depth_index);
+            if is_opaque && is_user_surface {
+                draw.push_opaque(strip);
+            } else {
+                draw.push_alpha(strip, processed.external_texture_id);
+            }
         }
     }
 
@@ -952,6 +1124,7 @@ impl Scheduler {
         tile: &WideTile<MODE_HYBRID>,
         wide_tile_x: u16,
         wide_tile_y: u16,
+        initial_round: usize,
         encoded_paints: &[EncodedPaint],
         idxs: &[u32],
         paint_bg: bool,
@@ -963,7 +1136,7 @@ impl Scheduler {
             // we just need to put _something_ there.
             dest_slot: ClaimedSlot::Texture0(SENTINEL_SLOT_IDX),
             temporary_slot: TemporarySlot::None,
-            round: self.round,
+            round: initial_round,
             opacity: 1.,
         });
 
@@ -1078,19 +1251,21 @@ impl Scheduler {
                                 .get(filter_textures.paint_idx as usize)
                                 .expect("filter paint not found");
                             let paint_tex_idx = paint_idxs[filter_textures.paint_idx as usize];
-                            let (payload, paint) = Self::process_encoded_paint(
+                            let processed = Self::process_encoded_paint(
                                 encoded_paint,
                                 paint_tex_idx,
                                 wide_tile_x,
                                 wide_tile_y,
                             );
+                            let depth_index = scheduler.depth.next(false);
                             scheduler.do_fill_with(
                                 state,
                                 &cmd,
                                 wide_tile_x,
                                 wide_tile_y,
-                                payload,
-                                paint,
+                                processed,
+                                false,
+                                depth_index,
                             );
                         };
 
@@ -1191,10 +1366,12 @@ impl Scheduler {
             if let TemporarySlot::Invalid(temp_slot) = tos.temporary_slot {
                 let next_round = depth.is_multiple_of(2);
                 let el_round = tos.round + usize::from(next_round);
+                let depth_index = self.depth.next(false);
                 let draw = self.draw_mut(el_round, temp_slot.get_texture());
-                draw.push(
+                draw.push_alpha(
                     GpuStripBuilder::at_slot(temp_slot.get_idx(), 0, WideTile::WIDTH)
-                        .copy_from_slot(tos.dest_slot.get_idx(), 0xFF),
+                        .copy_from_slot(tos.dest_slot.get_idx(), 0xFF, depth_index),
+                    None,
                 );
 
                 tos.temporary_slot = TemporarySlot::Valid(temp_slot);
@@ -1300,6 +1477,7 @@ impl Scheduler {
 
         let next_round: bool = depth.is_multiple_of(2) && depth > 2;
         let round = nos.round.max(tos.round + usize::from(next_round));
+        let depth_index = self.depth.next(false);
 
         let draw = self.draw_mut(
             round,
@@ -1315,19 +1493,22 @@ impl Scheduler {
         } else {
             GpuStripBuilder::at_slot(nos.dest_slot.get_idx(), 0, WideTile::WIDTH)
         };
-
         if let TemporarySlot::Valid(temp_slot) = nos.temporary_slot {
             let opacity_u8 = (tos.opacity * 255.0) as u8;
             let mix_mode = mode.mix as u8;
             let compose_mode = mode.compose as u8;
 
-            draw.push(gpu_strip_builder.blend(
-                tos.dest_slot.get_idx(),
-                temp_slot.get_idx(),
-                opacity_u8,
-                mix_mode,
-                compose_mode,
-            ));
+            draw.push_alpha(
+                gpu_strip_builder.blend(
+                    tos.dest_slot.get_idx(),
+                    temp_slot.get_idx(),
+                    opacity_u8,
+                    mix_mode,
+                    compose_mode,
+                    depth_index,
+                ),
+                None,
+            );
             // Invalidate the temporary slot after use
             let nos_ptr = state.tile_state.stack.len() - 2;
             state.tile_state.stack[nos_ptr].temporary_slot.invalidate();
@@ -1344,9 +1525,13 @@ impl Scheduler {
             // `BlendState::PREMULTIPLIED_ALPHA_BLENDING`). This is the whole reason
             // why for default blend modes, we don't need to rely on temporary slots
             // to achieve blending.
-            draw.push(
-                gpu_strip_builder
-                    .copy_from_slot(tos.dest_slot.get_idx(), (tos.opacity * 255.0) as u8),
+            draw.push_alpha(
+                gpu_strip_builder.copy_from_slot(
+                    tos.dest_slot.get_idx(),
+                    (tos.opacity * 255.0) as u8,
+                    depth_index,
+                ),
+                None,
             );
         }
     }
@@ -1363,6 +1548,7 @@ impl Scheduler {
         attrs: &CommandAttrs,
     ) {
         let depth = state.tile_state.stack.len();
+        let depth_index = self.depth.next(false);
 
         let el = state.tile_state.stack.last_mut().unwrap();
         let draw = self.draw_mut(el.round, el.get_draw_texture(depth));
@@ -1371,7 +1557,7 @@ impl Scheduler {
         let alpha_idx = fill_attrs.alpha_idx(cmd.alpha_offset);
         let col_idx = alpha_idx / u32::from(Tile::HEIGHT);
         let (scene_strip_x, scene_strip_y) = (wide_tile_x + cmd.x, wide_tile_y);
-        let (payload, paint) = Self::process_paint(
+        let processed = Self::process_paint(
             &fill_attrs.paint,
             encoded_paints,
             (scene_strip_x, scene_strip_y),
@@ -1389,10 +1575,13 @@ impl Scheduler {
             GpuStripBuilder::at_slot(slot_idx, cmd.x, cmd.width)
         };
 
-        draw.push(
-            gpu_strip_builder
-                .with_sparse(cmd.width, col_idx)
-                .paint(payload, paint),
+        draw.push_alpha(
+            gpu_strip_builder.with_sparse(cmd.width, col_idx).paint(
+                processed.payload,
+                processed.paint,
+                depth_index,
+            ),
+            processed.external_texture_id,
         );
     }
 
@@ -1408,15 +1597,31 @@ impl Scheduler {
         attrs: &CommandAttrs,
     ) {
         let fill_attrs = &attrs.fill[cmd.attrs_idx as usize];
+        let is_opaque = Self::is_paint_opaque(&fill_attrs.paint, encoded_paints);
+        let stack_depth = state.tile_state.stack.len();
+        let is_root_opaque = stack_depth == 1 && is_opaque && self.is_rendering_to_user_surface();
+        let depth_index = self.depth.next(
+            // We currently only support opaques that are drawn to the user surface.
+            // See TODO in `RendererBackend::render_strips`.
+            is_root_opaque,
+        );
         let (scene_strip_x, scene_strip_y) = (wide_tile_x + cmd.x, wide_tile_y);
-        let (payload, paint) = Self::process_paint(
+        let processed = Self::process_paint(
             &fill_attrs.paint,
             encoded_paints,
             (scene_strip_x, scene_strip_y),
             paint_idxs,
         );
 
-        self.do_fill_with(state, cmd, scene_strip_x, scene_strip_y, payload, paint);
+        self.do_fill_with(
+            state,
+            cmd,
+            scene_strip_x,
+            scene_strip_y,
+            processed,
+            is_root_opaque,
+            depth_index,
+        );
     }
 
     #[inline]
@@ -1426,8 +1631,9 @@ impl Scheduler {
         cmd: &CmdFill,
         scene_strip_x: u16,
         scene_strip_y: u16,
-        payload: u32,
-        paint: u32,
+        processed: ProcessedPaint,
+        is_root_opaque: bool,
+        depth_index: u32,
     ) {
         let depth = state.tile_state.stack.len();
 
@@ -1445,7 +1651,40 @@ impl Scheduler {
             GpuStripBuilder::at_slot(slot_idx, cmd.x, cmd.width)
         };
 
-        draw.push(gpu_strip_builder.paint(payload, paint));
+        let strip = gpu_strip_builder.paint(processed.payload, processed.paint, depth_index);
+        if is_root_opaque {
+            draw.push_opaque(strip);
+        } else {
+            draw.push_alpha(strip, processed.external_texture_id);
+        }
+    }
+
+    /// Determine if a paint is fully opaque.
+    #[inline]
+    fn is_paint_opaque(paint: &Paint, encoded_paints: &[EncodedPaint]) -> bool {
+        match paint {
+            Paint::Solid(color) => color.is_opaque(),
+            Paint::Indexed(indexed_paint) => {
+                let paint_id = indexed_paint.index();
+                match encoded_paints.get(paint_id) {
+                    Some(EncodedPaint::Image(img)) => {
+                        !img.may_have_transparency
+                            && img.sampler.alpha == 1.0
+                            && img.tint.is_none_or(|t| t.color.components[3] >= 1.0)
+                    }
+                    Some(EncodedPaint::ExternalTexture(g)) => {
+                        debug_assert!(
+                            g.may_have_transparency,
+                            "Front-to-back drawing of known-opaque external textures has not been implemented yet, so vello_hybrid always set `may_have_transparency` to `true` for now."
+                        );
+                        false
+                    }
+                    Some(EncodedPaint::Gradient(g)) => !g.may_have_transparency,
+                    Some(EncodedPaint::BlurredRoundedRect(_)) => false,
+                    None => unreachable!("Paint must be in encoded paints"),
+                }
+            }
+        }
     }
 
     #[inline]
@@ -1482,14 +1721,17 @@ impl Scheduler {
         // enough "ping-ponging" to resolve all dependencies.
         let next_round = depth.is_multiple_of(2) && depth > 2;
         let round = nos.round.max(tos.round + usize::from(next_round));
+        let depth_index = self.depth.next(false);
         if let TemporarySlot::Valid(temp_slot) = nos.temporary_slot {
             let draw = self.draw_mut(round, nos.dest_slot.get_texture());
-            draw.push(
+            draw.push_alpha(
                 GpuStripBuilder::at_slot(nos.dest_slot.get_idx(), 0, WideTile::WIDTH)
-                    .copy_from_slot(temp_slot.get_idx(), 0xFF),
+                    .copy_from_slot(temp_slot.get_idx(), 0xFF, depth_index),
+                None,
             );
         }
 
+        let depth_index = self.depth.next(false);
         let draw = self.draw_mut(
             round,
             if (depth - 1) <= 1 {
@@ -1503,7 +1745,10 @@ impl Scheduler {
         } else {
             GpuStripBuilder::at_slot(nos.dest_slot.get_idx(), cmd.x, cmd.width)
         };
-        draw.push(gpu_strip_builder.copy_from_slot(tos.dest_slot.get_idx(), 0xFF));
+        draw.push_alpha(
+            gpu_strip_builder.copy_from_slot(tos.dest_slot.get_idx(), 0xFF, depth_index),
+            None,
+        );
 
         let nos_ptr = state.tile_state.stack.len() - 2;
         state.tile_state.stack[nos_ptr].temporary_slot.invalidate();
@@ -1524,15 +1769,18 @@ impl Scheduler {
         let next_round = depth.is_multiple_of(2) && depth > 2;
         let round = nos.round.max(tos.round + usize::from(next_round));
 
+        let depth_index = self.depth.next(false);
         // If nos has a temporary slot, copy it to `dest_slot` first
         if let TemporarySlot::Valid(temp_slot) = nos.temporary_slot {
             let draw = self.draw_mut(round, nos.dest_slot.get_texture());
-            draw.push(
+            draw.push_alpha(
                 GpuStripBuilder::at_slot(nos.dest_slot.get_idx(), 0, WideTile::WIDTH)
-                    .copy_from_slot(temp_slot.get_idx(), 0xFF),
+                    .copy_from_slot(temp_slot.get_idx(), 0xFF, depth_index),
+                None,
             );
         }
 
+        let depth_index = self.depth.next(false);
         let draw = self.draw_mut(
             round,
             if (depth - 1) <= 1 {
@@ -1551,23 +1799,24 @@ impl Scheduler {
         let alpha_idx = clip_attrs.alpha_idx(cmd.alpha_offset);
         let col_idx = alpha_idx / u32::from(Tile::HEIGHT);
 
-        draw.push(
+        draw.push_alpha(
             gpu_strip_builder
                 .with_sparse(cmd.width, col_idx)
-                .copy_from_slot(tos.dest_slot.get_idx(), 0xFF),
+                .copy_from_slot(tos.dest_slot.get_idx(), 0xFF, depth_index),
+            None,
         );
         let nos_ptr = state.tile_state.stack.len() - 2;
         state.tile_state.stack[nos_ptr].temporary_slot.invalidate();
     }
 
-    /// Process a paint and return (`payload`, `paint`)
+    /// Process a paint and return the packed payload, paint and optional external texture id.
     #[inline(always)]
     fn process_paint(
         paint: &Paint,
         encoded_paints: &[EncodedPaint],
         (scene_strip_x, scene_strip_y): (u16, u16),
         paint_idxs: &[u32],
-    ) -> (u32, u32) {
+    ) -> ProcessedPaint {
         match paint {
             Paint::Solid(color) => {
                 let rgba = color.as_premul_rgba8().to_u32();
@@ -1576,7 +1825,11 @@ impl Scheduler {
                     "Color fields with 0 alpha are reserved for clipping"
                 );
                 let paint_packed = (COLOR_SOURCE_PAYLOAD << 30) | (PAINT_TYPE_SOLID << 27);
-                (rgba, paint_packed)
+                ProcessedPaint {
+                    payload: rgba,
+                    paint: paint_packed,
+                    external_texture_id: None,
+                }
             }
             Paint::Indexed(indexed_paint) => {
                 let paint_id = indexed_paint.index();
@@ -1597,7 +1850,7 @@ impl Scheduler {
         paint_idx: u32,
         scene_strip_x: u16,
         scene_strip_y: u16,
-    ) -> (u32, u32) {
+    ) -> ProcessedPaint {
         match encoded_paint {
             EncodedPaint::Image(encoded_image) => match &encoded_image.source {
                 ImageSource::OpaqueId { .. } => {
@@ -1605,10 +1858,25 @@ impl Scheduler {
                         | (PAINT_TYPE_IMAGE << 26)
                         | (paint_idx & 0x03FF_FFFF);
                     let scene_strip_xy = ((scene_strip_y as u32) << 16) | (scene_strip_x as u32);
-                    (scene_strip_xy, paint_packed)
+                    ProcessedPaint {
+                        payload: scene_strip_xy,
+                        paint: paint_packed,
+                        external_texture_id: None,
+                    }
                 }
                 _ => unimplemented!("Unsupported image source"),
             },
+            EncodedPaint::ExternalTexture(texture) => {
+                let paint_packed = (COLOR_SOURCE_PAYLOAD << 29)
+                    | (PAINT_TYPE_IMAGE << 26)
+                    | (paint_idx & 0x03FF_FFFF);
+                let scene_strip_xy = ((scene_strip_y as u32) << 16) | (scene_strip_x as u32);
+                ProcessedPaint {
+                    payload: scene_strip_xy,
+                    paint: paint_packed,
+                    external_texture_id: Some(texture.texture_id),
+                }
+            }
             EncodedPaint::Gradient(gradient) => {
                 use vello_common::encode::EncodedKind;
                 let gradient_paint_type = match &gradient.kind {
@@ -1620,9 +1888,23 @@ impl Scheduler {
                     | (gradient_paint_type << 26)
                     | (paint_idx & 0x03FF_FFFF);
                 let scene_strip_xy = ((scene_strip_y as u32) << 16) | (scene_strip_x as u32);
-                (scene_strip_xy, paint_packed)
+                ProcessedPaint {
+                    payload: scene_strip_xy,
+                    paint: paint_packed,
+                    external_texture_id: None,
+                }
             }
-            _ => unimplemented!("Unsupported paint type"),
+            EncodedPaint::BlurredRoundedRect(_) => {
+                let paint_packed = (COLOR_SOURCE_PAYLOAD << 29)
+                    | (PAINT_TYPE_BLURRED_ROUNDED_RECT << 26)
+                    | (paint_idx & 0x03FF_FFFF);
+                let scene_strip_xy = ((scene_strip_y as u32) << 16) | (scene_strip_x as u32);
+                ProcessedPaint {
+                    payload: scene_strip_xy,
+                    paint: paint_packed,
+                    external_texture_id: None,
+                }
+            }
         }
     }
 }
@@ -1667,7 +1949,7 @@ impl GpuStripBuilder {
     }
 
     /// Paint into strip.
-    fn paint(self, payload: u32, paint: u32) -> GpuStrip {
+    fn paint(self, payload: u32, paint: u32, depth_index: u32) -> GpuStrip {
         GpuStrip {
             x: self.x,
             y: self.y,
@@ -1676,11 +1958,12 @@ impl GpuStripBuilder {
             col_idx_or_rect_frac: self.col_idx_or_rect_frac,
             payload,
             paint_and_rect_flag: paint,
+            depth_index,
         }
     }
 
     /// Copy from slot.
-    fn copy_from_slot(self, from_slot: usize, opacity: u8) -> GpuStrip {
+    fn copy_from_slot(self, from_slot: usize, opacity: u8, depth_index: u32) -> GpuStrip {
         GpuStrip {
             x: self.x,
             y: self.y,
@@ -1689,6 +1972,7 @@ impl GpuStripBuilder {
             col_idx_or_rect_frac: self.col_idx_or_rect_frac,
             payload: u32::try_from(from_slot).unwrap(),
             paint_and_rect_flag: (COLOR_SOURCE_SLOT << 29) | (opacity as u32),
+            depth_index,
         }
     }
 
@@ -1700,6 +1984,7 @@ impl GpuStripBuilder {
         opacity: u8,
         mix_mode: u8,
         compose_mode: u8,
+        depth_index: u32,
     ) -> GpuStrip {
         GpuStrip {
             x: self.x,
@@ -1713,6 +1998,7 @@ impl GpuStripBuilder {
                 | ((opacity as u32) << 16)
                 | ((mix_mode as u32) << 8)
                 | (compose_mode as u32),
+            depth_index,
         }
     }
 }
@@ -1728,7 +2014,9 @@ fn generate_gpu_strips_for_fast_path(
     scene: &Scene,
     encoded_paints: &[EncodedPaint],
     paint_idxs: &[u32],
-    gpu_strips: &mut Vec<GpuStrip>,
+    depth_index: u32,
+    is_opaque: bool,
+    draw: &mut Draw,
 ) {
     let strips = &strip_storage.strips[path.strips.clone()];
 
@@ -1756,12 +2044,13 @@ fn generate_gpu_strips_for_fast_path(
 
         // Alpha fill for the strip's coverage region.
         if strip_width > 0 {
-            let (payload, paint) =
+            let processed =
                 Scheduler::process_paint(&path.paint, encoded_paints, (x0, y), paint_idxs);
-            gpu_strips.push(
+            draw.push_alpha(
                 GpuStripBuilder::at_surface(x0, y, strip_width)
                     .with_sparse(strip_width, col)
-                    .paint(payload, paint),
+                    .paint(processed.payload, processed.paint, depth_index),
+                processed.external_texture_id,
             );
         }
 
@@ -1775,9 +2064,18 @@ fn generate_gpu_strips_for_fast_path(
                     .unwrap_or(u16::MAX),
             );
             if x2 > x1 {
-                let (payload, paint) =
+                let processed =
                     Scheduler::process_paint(&path.paint, encoded_paints, (x1, y), paint_idxs);
-                gpu_strips.push(GpuStripBuilder::at_surface(x1, y, x2 - x1).paint(payload, paint));
+                let strip = GpuStripBuilder::at_surface(x1, y, x2 - x1).paint(
+                    processed.payload,
+                    processed.paint,
+                    depth_index,
+                );
+                if is_opaque {
+                    draw.push_opaque(strip);
+                } else {
+                    draw.push_alpha(strip, processed.external_texture_id);
+                }
             }
         }
     }
@@ -1787,7 +2085,54 @@ fn pack_rectangle_into_gpu(
     rect: &FastPathRect,
     encoded_paints: &[EncodedPaint],
     paint_idxs: &[u32],
-) -> GpuStrip {
+    depth_index: u32,
+    is_opaque: bool,
+    draw: &mut Draw,
+) {
+    let split = split_rect(rect);
+
+    let mut is_first = true;
+    for part in [
+        Some(split.main),
+        split.top,
+        split.bottom,
+        split.left,
+        split.right,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let processed =
+            Scheduler::process_paint(&rect.paint, encoded_paints, (part.x, part.y), paint_idxs);
+        let strip = make_gpu_rect(part, processed.payload, processed.paint, depth_index);
+        if is_first && is_opaque && part.frac == 0 {
+            draw.push_opaque(strip);
+        } else {
+            draw.push_alpha(strip, processed.external_texture_id);
+        }
+        is_first = false;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RectPart {
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+    frac: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SplitRect {
+    main: RectPart,
+    top: Option<RectPart>,
+    bottom: Option<RectPart>,
+    left: Option<RectPart>,
+    right: Option<RectPart>,
+}
+
+fn split_rect(rect: &FastPathRect) -> SplitRect {
     let sx0 = rect.x0.floor();
     let sy0 = rect.y0.floor();
     let sx1 = rect.x1.ceil();
@@ -1799,21 +2144,103 @@ fn pack_rectangle_into_gpu(
     let width = (sx1 - sx0) as u16;
     let height = (sy1 - sy0) as u16;
 
-    let (payload, paint_packed) =
-        Scheduler::process_paint(&rect.paint, encoded_paints, (x, y), paint_idxs);
+    // Note that `top_frac` and `left_fract` store the actual coverage, while
+    // `right_frac` and `bottom_fract` store one minus the coverage. This is on purpose
+    // and handled that way in the shader.
+    let left_frac = rect.x0 - sx0;
+    let top_frac = rect.y0 - sy0;
+    let right_frac = sx1 - rect.x1;
+    let bottom_frac = sy1 - rect.y1;
 
-    // Determine the fractional offsets for anti-aliasing and quantize so it
-    // fits into u8.
-    let frac = pack_unorm4x8([rect.x0 - sx0, rect.y0 - sy0, sx1 - rect.x1, sy1 - rect.y1]);
+    // There's a balance to strike between reducing work in the fragment shader by splitting
+    // out the inner part of the rectangle without anti-aliasing, and additional overhead
+    // that arises from rendering 5 rectangles instead of just one. While the exact threshold
+    // will obviously depend on the device, some experiments on a low-tier tablet showed that
+    // `LARGE_RECT_SPLIT_THRESHOLD` seems to be a a reasonable value.
+    if rect.x1 - rect.x0 < f32::from(LARGE_RECT_SPLIT_THRESHOLD)
+        || rect.y1 - rect.y0 < f32::from(LARGE_RECT_SPLIT_THRESHOLD)
+    {
+        return SplitRect {
+            main: RectPart {
+                x,
+                y,
+                width,
+                height,
+                frac: pack_unorm4x8([left_frac, top_frac, right_frac, bottom_frac]),
+            },
+            top: None,
+            bottom: None,
+            left: None,
+            right: None,
+        };
+    }
 
+    let has_left_aa = left_frac > 0.0;
+    let has_top_aa = top_frac > 0.0;
+    let has_right_aa = right_frac > 0.0;
+    let has_bottom_aa = bottom_frac > 0.0;
+    let has_top_strip = has_top_aa || has_left_aa || has_right_aa;
+    let has_bottom_strip = has_bottom_aa || has_left_aa || has_right_aa;
+    let left_inset = u16::from(has_left_aa);
+    let right_inset = u16::from(has_right_aa);
+    let top_inset = u16::from(has_top_strip);
+    let bottom_inset = u16::from(has_bottom_strip);
+    let inner_x = x + left_inset;
+    let inner_y = y + top_inset;
+    // Can't underflow because rectangles have at least `LARGE_RECT_SPLIT_THRESHOLD` in each
+    // direction, which is larger than 2.
+    let inner_width = width - left_inset - right_inset;
+    let inner_height = height - top_inset - bottom_inset;
+
+    SplitRect {
+        main: RectPart {
+            x: inner_x,
+            y: inner_y,
+            width: inner_width,
+            height: inner_height,
+            frac: 0,
+        },
+        top: has_top_strip.then_some(RectPart {
+            x,
+            y,
+            width,
+            height: 1,
+            frac: pack_unorm4x8([left_frac, top_frac, right_frac, 0.0]),
+        }),
+        bottom: has_bottom_strip.then_some(RectPart {
+            x,
+            y: y + height - 1,
+            width,
+            height: 1,
+            frac: pack_unorm4x8([left_frac, 0.0, right_frac, bottom_frac]),
+        }),
+        left: has_left_aa.then_some(RectPart {
+            x,
+            y: inner_y,
+            width: 1,
+            height: inner_height,
+            frac: pack_unorm4x8([left_frac, 0.0, 0.0, 0.0]),
+        }),
+        right: has_right_aa.then_some(RectPart {
+            x: x + width - 1,
+            y: inner_y,
+            width: 1,
+            height: inner_height,
+            frac: pack_unorm4x8([0.0, 0.0, right_frac, 0.0]),
+        }),
+    }
+}
+
+fn make_gpu_rect(part: RectPart, payload: u32, paint_packed: u32, depth_index: u32) -> GpuStrip {
     GpuStrip {
-        x,
-        y,
-        width,
-        dense_width_or_rect_height: height,
-        col_idx_or_rect_frac: frac,
+        x: part.x,
+        y: part.y,
+        width: part.width,
+        dense_width_or_rect_height: part.height,
+        col_idx_or_rect_frac: part.frac,
         payload,
         paint_and_rect_flag: paint_packed | RECT_STRIP_FLAG,
+        depth_index,
     }
 }
 
@@ -1823,4 +2250,325 @@ fn pack_unorm4x8(v: [f32; 4]) -> u32 {
         | (u32::from(q(v[1])) << 8)
         | (u32::from(q(v[2])) << 16)
         | (u32::from(q(v[3])) << 24)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Draw, ExternalTextureRun, GpuStrip, RECT_STRIP_FLAG, RectPart, SplitRect, TextureId,
+        pack_rectangle_into_gpu, pack_unorm4x8, split_rect,
+    };
+    use crate::scene::FastPathRect;
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use vello_common::encode::EncodedImage;
+    use vello_common::kurbo::{Affine, Vec2};
+    use vello_common::paint::{Color, ImageId, ImageSource, IndexedPaint, Paint};
+    use vello_common::peniko::ImageSampler;
+
+    const DUMMY_STRIP: GpuStrip = GpuStrip {
+        x: 0,
+        y: 0,
+        width: 1,
+        dense_width_or_rect_height: 1,
+        col_idx_or_rect_frac: 0,
+        payload: 0,
+        paint_and_rect_flag: 0,
+        depth_index: 0,
+    };
+
+    #[test]
+    fn draw_external_texture_runs() {
+        let texture_a = TextureId(1);
+        let texture_b = TextureId(2);
+        let mut draw = Draw::default();
+
+        draw.push_alpha(DUMMY_STRIP, None);
+        assert!(draw.external_texture_runs.is_empty());
+
+        draw.push_alpha(DUMMY_STRIP, Some(texture_a));
+        draw.push_alpha(DUMMY_STRIP, Some(texture_a));
+        draw.push_alpha(DUMMY_STRIP, None);
+        draw.push_alpha(DUMMY_STRIP, Some(texture_b));
+        draw.push_alpha(DUMMY_STRIP, None);
+        draw.push_alpha(DUMMY_STRIP, Some(texture_b));
+        draw.push_alpha(DUMMY_STRIP, Some(texture_a));
+
+        assert_eq!(
+            draw.external_texture_runs,
+            vec![
+                ExternalTextureRun {
+                    strips_start: 0,
+                    texture_id: texture_a,
+                },
+                ExternalTextureRun {
+                    strips_start: 4,
+                    texture_id: texture_b,
+                },
+                ExternalTextureRun {
+                    strips_start: 7,
+                    texture_id: texture_a,
+                },
+            ]
+        );
+    }
+
+    fn solid_rect(x0: f32, y0: f32, x1: f32, y1: f32) -> FastPathRect {
+        FastPathRect {
+            x0,
+            y0,
+            x1,
+            y1,
+            paint: Paint::from(Color::from_rgba8(255, 0, 0, 255)),
+        }
+    }
+
+    fn part(x: u16, y: u16, width: u16, height: u16, frac: [f32; 4]) -> RectPart {
+        RectPart {
+            x,
+            y,
+            width,
+            height,
+            frac: pack_unorm4x8(frac),
+        }
+    }
+
+    #[test]
+    fn splitter_keeps_small_rect_whole() {
+        let rect = solid_rect(10.25, 20.5, 25.75, 35.25);
+        let split = split_rect(&rect);
+
+        assert_eq!(
+            split,
+            SplitRect {
+                main: part(10, 20, 16, 16, [0.25, 0.5, 0.25, 0.75]),
+                top: None,
+                bottom: None,
+                left: None,
+                right: None,
+            }
+        );
+    }
+
+    #[test]
+    fn splitter_keeps_subpixel_rect_inside_one_pixel() {
+        let rect = solid_rect(10.125, 20.25, 10.875, 20.75);
+        let split = split_rect(&rect);
+
+        assert_eq!(
+            split,
+            SplitRect {
+                main: part(10, 20, 1, 1, [0.125, 0.25, 0.125, 0.25]),
+                top: None,
+                bottom: None,
+                left: None,
+                right: None,
+            }
+        );
+    }
+
+    #[test]
+    fn splitter_keeps_subpixel_rect_spanning_two_pixels_in_width() {
+        let rect = solid_rect(10.75, 20.125, 11.25, 20.875);
+        let split = split_rect(&rect);
+
+        assert_eq!(
+            split,
+            SplitRect {
+                main: part(10, 20, 2, 1, [0.75, 0.125, 0.75, 0.125]),
+                top: None,
+                bottom: None,
+                left: None,
+                right: None,
+            }
+        );
+    }
+
+    #[test]
+    fn splitter_keeps_subpixel_rect_spanning_two_pixels_in_height() {
+        let rect = solid_rect(10.125, 20.75, 10.875, 21.25);
+        let split = split_rect(&rect);
+
+        assert_eq!(
+            split,
+            SplitRect {
+                main: part(10, 20, 1, 2, [0.125, 0.75, 0.125, 0.75]),
+                top: None,
+                bottom: None,
+                left: None,
+                right: None,
+            }
+        );
+    }
+
+    #[test]
+    fn splitter_keeps_multi_pixel_width_rect_within_one_pixel_height() {
+        let rect = solid_rect(10.25, 20.125, 14.75, 20.875);
+        let split = split_rect(&rect);
+
+        assert_eq!(
+            split,
+            SplitRect {
+                main: part(10, 20, 5, 1, [0.25, 0.125, 0.25, 0.125]),
+                top: None,
+                bottom: None,
+                left: None,
+                right: None,
+            }
+        );
+    }
+
+    #[test]
+    fn splitter_keeps_multi_pixel_height_rect_within_one_pixel_width() {
+        let rect = solid_rect(10.125, 20.25, 10.875, 24.75);
+        let split = split_rect(&rect);
+
+        assert_eq!(
+            split,
+            SplitRect {
+                main: part(10, 20, 1, 5, [0.125, 0.25, 0.125, 0.25]),
+                top: None,
+                bottom: None,
+                left: None,
+                right: None,
+            }
+        );
+    }
+
+    #[test]
+    fn splitter_splits_large_rect_into_five_parts() {
+        let rect = solid_rect(10.25, 20.5, 42.75, 52.75);
+        let split = split_rect(&rect);
+
+        assert_eq!(
+            split,
+            SplitRect {
+                main: part(11, 21, 31, 31, [0.0, 0.0, 0.0, 0.0]),
+                top: Some(part(10, 20, 33, 1, [0.25, 0.5, 0.25, 0.0])),
+                bottom: Some(part(10, 52, 33, 1, [0.25, 0.0, 0.25, 0.25])),
+                left: Some(part(10, 21, 1, 31, [0.25, 0.0, 0.0, 0.0])),
+                right: Some(part(42, 21, 1, 31, [0.0, 0.0, 0.25, 0.0])),
+            }
+        );
+    }
+
+    #[test]
+    fn splitter_omits_unneeded_edge_parts() {
+        let rect = solid_rect(10.0, 20.5, 42.0, 53.0);
+        let split = split_rect(&rect);
+
+        assert_eq!(
+            split,
+            SplitRect {
+                main: part(10, 21, 32, 32, [0.0, 0.0, 0.0, 0.0]),
+                top: Some(part(10, 20, 32, 1, [0.0, 0.5, 0.0, 0.0])),
+                bottom: None,
+                left: None,
+                right: None,
+            }
+        );
+    }
+
+    #[test]
+    fn splitter_handles_large_rect_with_only_vertical_aa() {
+        let rect = solid_rect(5.0, 2.25, 37.0, 34.75);
+        let split = split_rect(&rect);
+
+        assert_eq!(
+            split,
+            SplitRect {
+                main: part(5, 3, 32, 31, [0.0, 0.0, 0.0, 0.0]),
+                top: Some(part(5, 2, 32, 1, [0.0, 0.25, 0.0, 0.0])),
+                bottom: Some(part(5, 34, 32, 1, [0.0, 0.0, 0.0, 0.25])),
+                left: None,
+                right: None,
+            }
+        );
+    }
+
+    #[test]
+    fn splitter_keeps_large_aligned_rect_as_single_main_rect() {
+        let rect = solid_rect(10.0, 20.0, 42.0, 60.0);
+        let split = split_rect(&rect);
+
+        assert_eq!(
+            split,
+            SplitRect {
+                main: part(10, 20, 32, 40, [0.0, 0.0, 0.0, 0.0]),
+                top: None,
+                bottom: None,
+                left: None,
+                right: None,
+            }
+        );
+    }
+
+    #[test]
+    fn gpu_upload_emits_main_and_present_optional_parts() {
+        let rect = solid_rect(10.0, 20.5, 42.0, 53.0);
+        let mut draw = Draw::default();
+
+        pack_rectangle_into_gpu(&rect, &[], &[], 0, true, &mut draw);
+
+        let out: Vec<_> = draw.opaque.iter().chain(draw.alpha.iter()).collect();
+        assert_eq!(out.len(), 2);
+        assert_eq!(
+            (
+                out[0].x,
+                out[0].y,
+                out[0].width,
+                out[0].dense_width_or_rect_height
+            ),
+            (10, 21, 32, 32)
+        );
+        assert_eq!(out[0].col_idx_or_rect_frac, 0);
+        assert_eq!(
+            (
+                out[1].x,
+                out[1].y,
+                out[1].width,
+                out[1].dense_width_or_rect_height
+            ),
+            (10, 20, 32, 1)
+        );
+        assert_eq!(
+            out[1].col_idx_or_rect_frac,
+            pack_unorm4x8([0.0, 0.5, 0.0, 0.0])
+        );
+        assert!(
+            out.iter()
+                .all(|strip| strip.paint_and_rect_flag & RECT_STRIP_FLAG != 0)
+        );
+    }
+
+    #[test]
+    fn gpu_upload_updates_payload_for_each_split_part() {
+        let rect = FastPathRect {
+            x0: 10.25,
+            y0: 20.5,
+            x1: 42.75,
+            y1: 52.75,
+            paint: Paint::Indexed(IndexedPaint::new(0)),
+        };
+        let encoded_paints = vec![vello_common::encode::EncodedPaint::Image(EncodedImage {
+            source: ImageSource::opaque_id(ImageId::new(1)),
+            sampler: ImageSampler::new(),
+            may_have_transparency: false,
+            transform: Affine::IDENTITY,
+            x_advance: Vec2::new(1.0, 0.0),
+            y_advance: Vec2::new(0.0, 1.0),
+            tint: None,
+        })];
+        let mut draw = Draw::default();
+
+        pack_rectangle_into_gpu(&rect, &encoded_paints, &[7], 0, true, &mut draw);
+
+        let out: Vec<_> = draw.opaque.iter().chain(draw.alpha.iter()).collect();
+        assert_eq!(out.len(), 5);
+        assert_eq!(out[0].payload, (21_u32 << 16) | 11_u32);
+        assert_eq!(out[1].payload, (20_u32 << 16) | 10_u32);
+        assert_eq!(out[2].payload, (52_u32 << 16) | 10_u32);
+        assert_eq!(out[3].payload, (21_u32 << 16) | 10_u32);
+        assert_eq!(out[4].payload, (21_u32 << 16) | 42_u32);
+    }
 }

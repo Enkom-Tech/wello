@@ -5,24 +5,25 @@
 
 use crate::renderer::Renderer;
 use crate::util::stops_blue_green_red_yellow;
+use crate::util::{layout_glyphs_noto_cbtf, render_pixmap};
 use std::sync::Arc;
-use vello_api::peniko::GradientKind::Radial;
-use vello_api::peniko::color::palette::css::{PURPLE, ROYAL_BLUE, TOMATO};
-use vello_api::peniko::kurbo::Point;
-use vello_api::peniko::{ColorStops, RadialGradientPosition};
 use vello_common::color::PremulRgba8;
 use vello_common::color::palette::css::{BLUE, DARK_BLUE, LIME, REBECCA_PURPLE};
-use vello_common::filter_effects::{Filter, FilterPrimitive};
+use vello_common::filter_effects::{EdgeMode, Filter, FilterPrimitive};
 use vello_common::kurbo::{Affine, BezPath, Rect, Shape, Stroke};
 use vello_common::paint::Image;
+use vello_common::peniko::GradientKind::Radial;
+use vello_common::peniko::color::palette::css::{PURPLE, ROYAL_BLUE, TOMATO};
+use vello_common::peniko::kurbo::Point;
 use vello_common::peniko::{
     BlendMode, Color, ColorStop, Fill, Gradient, ImageQuality, ImageSampler,
     InterpolationAlphaSpace, Mix,
 };
+use vello_common::peniko::{ColorStops, RadialGradientPosition};
 use vello_common::pixmap::Pixmap;
 use vello_cpu::color::palette::css::{BLACK, RED};
 use vello_cpu::peniko::{Compose, Extend};
-use vello_cpu::{Level, RenderContext, RenderMode, RenderSettings};
+use vello_cpu::{Level, RasterizerSettings, RenderContext, RenderMode, RenderSettings};
 use vello_dev_macros::vello_test;
 
 #[vello_test(width = 8, height = 8)]
@@ -372,6 +373,20 @@ fn clip_clear(ctx: &mut impl Renderer) {
     ctx.pop_layer();
 }
 
+/// Reproduces stale pixels when the hybrid WGPU path reuses a render target without clearing it.
+#[vello_test(width = 64, height = 64, transparent)]
+fn render_target_cleared_between_frames(ctx: &mut impl Renderer) {
+    ctx.set_paint(RED);
+    ctx.fill_rect(&Rect::new(0.0, 0.0, 64.0, 64.0));
+    ctx.flush();
+    let _ = render_pixmap(ctx);
+
+    ctx.reset();
+
+    ctx.set_paint(LIME);
+    ctx.fill_rect(&Rect::new(16.0, 16.0, 48.0, 48.0));
+}
+
 /// <https://github.com/web-platform-tests/wpt/blob/18c64a74b1/html/canvas/element/fill-and-stroke-styles/2d.gradient.interpolate.coloralpha.html>
 /// See <https://github.com/linebender/vello/issues/1056>.
 #[vello_test(width = 100, height = 50)]
@@ -419,17 +434,31 @@ fn multi_threading_oob_access() {
     let settings = RenderSettings {
         level: Level::try_detect().unwrap_or(Level::baseline()),
         num_threads: 4,
-        render_mode: RenderMode::OptimizeQuality,
     };
     let mut ctx = RenderContext::new_with(100, 100, settings);
+    let mut resources = vello_cpu::Resources::new();
     let mut pixmap = Pixmap::new(100, 100);
 
     ctx.fill_path(&Rect::new(0.0, 0.0, 50.0, 50.0).to_path(0.1));
     ctx.flush();
-    ctx.render_to_pixmap(&mut pixmap);
+    ctx.render_with(
+        &mut pixmap,
+        &mut resources,
+        RasterizerSettings {
+            render_mode: RenderMode::OptimizeQuality,
+            ..Default::default()
+        },
+    );
     ctx.fill_path(&Rect::new(50.0, 50.0, 100.0, 100.0).to_path(0.1));
     ctx.flush();
-    ctx.render_to_pixmap(&mut pixmap);
+    ctx.render_with(
+        &mut pixmap,
+        &mut resources,
+        RasterizerSettings {
+            render_mode: RenderMode::OptimizeQuality,
+            ..Default::default()
+        },
+    );
 }
 
 /// See <https://github.com/linebender/vello/issues/1181>.
@@ -614,6 +643,23 @@ fn issue_1477(ctx: &mut impl Renderer) {
     ctx.fill_rect(&rect);
 }
 
+#[vello_test(skip_multithreaded, width = 768, height = 100, hybrid_tolerance = 3)]
+fn issue_1509(ctx: &mut impl Renderer) {
+    let filter = Filter::from_primitive(FilterPrimitive::GaussianBlur {
+        std_deviation: 25.0,
+        edge_mode: EdgeMode::None,
+    });
+    let rect = Rect::new(100.0, 10.0, 668.0, 90.0);
+
+    ctx.push_filter_layer(filter);
+    ctx.set_paint(ROYAL_BLUE);
+    ctx.fill_rect(&rect);
+    ctx.pop_layer();
+
+    ctx.set_paint(TOMATO);
+    ctx.fill_rect(&Rect::new(232.0, 30.0, 536.0, 70.0));
+}
+
 // This test exists because blending wouldn't properly preserve anti-aliasing in `vello_hybrid`.
 #[vello_test(skip_multithreaded)]
 fn issue_flush_fast_path_with_blending(ctx: &mut impl Renderer) {
@@ -695,4 +741,82 @@ fn issue_1528(ctx: &mut impl Renderer) {
     };
     ctx.set_paint(grad3);
     ctx.fill_rect(&Rect::new(-250.0, -250.0, -150.0, -150.0));
+}
+
+#[vello_test]
+fn issue_fast_path_strips_in_later_round(ctx: &mut impl Renderer) {
+    ctx.push_layer(None, None, None, None, None);
+    ctx.push_layer(None, None, None, None, None);
+    ctx.push_layer(None, None, None, None, None);
+    ctx.set_paint(Color::from_rgba8(0, 0, 255, 255));
+    ctx.fill_rect(&Rect::new(10.0, 10.0, 70.0, 70.0));
+    ctx.pop_layer();
+    ctx.pop_layer();
+    ctx.pop_layer();
+
+    ctx.set_paint(Color::from_rgba8(255, 0, 0, 255));
+    ctx.fill_rect(&Rect::new(30.0, 30.0, 90.0, 90.0));
+}
+
+#[vello_test]
+fn issue_coarse_batch_in_later_round(ctx: &mut impl Renderer) {
+    ctx.push_layer(None, None, None, None, None);
+    ctx.push_layer(None, None, None, None, None);
+    ctx.push_layer(None, None, None, None, None);
+    ctx.set_paint(Color::from_rgba8(0, 0, 255, 255));
+    ctx.fill_rect(&Rect::new(10.0, 10.0, 70.0, 70.0));
+    ctx.pop_layer();
+    ctx.pop_layer();
+    ctx.pop_layer();
+
+    ctx.push_layer(None, None, None, None, None);
+    ctx.set_paint(Color::from_rgba8(255, 0, 0, 255));
+    ctx.fill_rect(&Rect::new(30.0, 30.0, 90.0, 90.0));
+    ctx.pop_layer();
+}
+
+#[vello_test]
+fn issue_fast_path_strips_and_coarse_batch_in_later_round(ctx: &mut impl Renderer) {
+    ctx.push_layer(None, None, None, None, None);
+    ctx.push_layer(None, None, None, None, None);
+    ctx.push_layer(None, None, None, None, None);
+    ctx.set_paint(Color::from_rgba8(0, 0, 255, 255));
+    ctx.fill_rect(&Rect::new(25.0, 10.0, 75.0, 60.0));
+    ctx.pop_layer();
+    ctx.pop_layer();
+    ctx.pop_layer();
+
+    ctx.set_paint(Color::from_rgba8(0, 255, 0, 255));
+    ctx.fill_rect(&Rect::new(10.0, 40.0, 60.0, 90.0));
+
+    ctx.push_layer(None, None, None, None, None);
+    ctx.set_paint(Color::from_rgba8(255, 0, 0, 255));
+    ctx.fill_rect(&Rect::new(40.0, 40.0, 90.0, 90.0));
+    ctx.pop_layer();
+}
+
+#[vello_test(width = 32, height = 32, skip_hybrid, cpu_u8_tolerance = 1)]
+fn issue_bicubic_filtering_clamping(ctx: &mut impl Renderer) {
+    let font_size = 10.0;
+    let (font, glyphs) = layout_glyphs_noto_cbtf("👀", font_size);
+
+    ctx.set_paint(BLACK);
+    ctx.fill_rect(&Rect::new(0.0, 0.0, 32.0, 32.0));
+
+    ctx.set_transform(Affine::translate((5.0, 19.0)));
+    ctx.glyph_run(&font)
+        .font_size(font_size)
+        .fill_glyphs(glyphs.into_iter());
+}
+
+#[vello_test(skip_multithreaded)]
+fn issue_filter_preserves_painter_order_for_opaque_and_alpha(ctx: &mut impl Renderer) {
+    let filter = Filter::from_primitive(FilterPrimitive::Offset { dx: 0.0, dy: 0.0 });
+
+    ctx.push_filter_layer(filter);
+    ctx.set_paint(Color::from_rgba8(0, 0, 255, 128));
+    ctx.fill_rect(&Rect::new(20.0, 20.0, 80.0, 80.0));
+    ctx.set_paint(RED);
+    ctx.fill_rect(&Rect::new(30.0, 30.0, 70.0, 70.0));
+    ctx.pop_layer();
 }

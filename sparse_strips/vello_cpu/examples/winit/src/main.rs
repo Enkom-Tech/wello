@@ -18,7 +18,7 @@ use vello_common::paint::ImageSource;
 use vello_common::pixmap::Pixmap;
 use vello_cpu::{RenderContext, RenderSettings};
 use vello_example_scenes::image::ImageScene;
-use vello_example_scenes::{AnyScene, get_example_scenes};
+use vello_example_scenes::{AnyScene, Capabilities, get_example_scenes};
 use winit::{
     application::ApplicationHandler,
     event::{ElementState, KeyEvent, Modifiers, MouseButton, MouseScrollDelta, WindowEvent},
@@ -79,10 +79,11 @@ fn main() {
             ImageSource::Pixmap(std::sync::Arc::new(pixmap1)),
             ImageSource::Pixmap(std::sync::Arc::new(pixmap2)),
         ];
+        let capabilities = Capabilities::default();
         let scenes = if svg_paths.is_empty() {
-            get_example_scenes(None, img_sources)
+            get_example_scenes(capabilities, None, img_sources)
         } else {
-            get_example_scenes(Some(svg_paths), img_sources)
+            get_example_scenes(capabilities, Some(svg_paths), img_sources)
         };
 
         start_scene_index = start_scene_index.min(scenes.len() - 1);
@@ -93,10 +94,13 @@ fn main() {
         let pixmap1 = ImageScene::read_flower_image();
         let pixmap2 = ImageScene::read_cowboy_image();
         (
-            get_example_scenes(vec![
-                ImageSource::Pixmap(std::sync::Arc::new(pixmap1)),
-                ImageSource::Pixmap(std::sync::Arc::new(pixmap2)),
-            ]),
+            get_example_scenes(
+                Capabilities::default(),
+                vec![
+                    ImageSource::Pixmap(std::sync::Arc::new(pixmap1)),
+                    ImageSource::Pixmap(std::sync::Arc::new(pixmap2)),
+                ],
+            ),
             0,
         )
     };
@@ -316,13 +320,15 @@ impl ApplicationHandler for App {
                     _ => {}
                 }
             }
-            WindowEvent::MouseInput { state, button, .. } => {
-                if button == MouseButton::Left {
-                    self.mouse_down = state == ElementState::Pressed;
-                    if !self.mouse_down {
-                        // Mouse button released
-                        self.last_cursor_position = None;
-                    }
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => {
+                self.mouse_down = state == ElementState::Pressed;
+                if !self.mouse_down {
+                    // Mouse button released
+                    self.last_cursor_position = None;
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -388,9 +394,13 @@ impl ApplicationHandler for App {
                     if now.duration_since(self.fps_update_time).as_secs_f64() >= 1.0 {
                         let avg_frame_time = self.accumulated_frame_time / self.frame_count as f64;
                         let avg_fps = 1000.0 / avg_frame_time;
-                        println!("Average FPS: {avg_fps:.1}");
+                        let status = self.scenes[self.current_scene]
+                            .status()
+                            .map(|s| format!(" - {s}"))
+                            .unwrap_or_default();
+                        println!("Average FPS: {avg_fps:.1}{status}");
                         window.set_title(&format!(
-                            "Vello CPU - Scene {} - {:.1} FPS ({:.2}ms avg)",
+                            "Vello CPU - Scene {} - {:.1} FPS ({:.2}ms avg){status}",
                             self.current_scene, avg_fps, avg_frame_time
                         ));
 
@@ -447,7 +457,10 @@ impl ApplicationHandler for App {
 
                 self.scenes[self.current_scene].render(&mut self.renderer, self.transform);
                 self.renderer.flush();
-                self.renderer.render_to_pixmap(&mut self.pixmap);
+                self.renderer.render(
+                    &mut self.pixmap,
+                    self.scenes[self.current_scene].resources_mut(),
+                );
 
                 // Copy pixmap to window surface
                 let mut buffer = surface.buffer_mut().unwrap();
@@ -463,9 +476,7 @@ impl ApplicationHandler for App {
                 buffer.present().unwrap();
 
                 // Request continuous redraw for FPS measurement
-                if self.rotating || self.shearing {
-                    window.request_redraw();
-                }
+                window.request_redraw();
             }
             _ => {}
         }

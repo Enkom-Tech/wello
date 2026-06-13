@@ -35,6 +35,7 @@ mod blurred_rounded_rect;
 mod clip;
 mod compose;
 mod default_blending_only_fast_path;
+mod external_texture;
 mod filter;
 mod glyph;
 mod gradient;
@@ -44,7 +45,6 @@ mod layer;
 mod mask;
 mod mix;
 mod opacity;
-mod recording;
 mod renderer;
 mod scenes;
 #[macro_use]

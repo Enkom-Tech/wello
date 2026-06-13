@@ -26,7 +26,52 @@ pub struct Pixmap {
     ///
     /// Note: This may become stale if pixels are modified via [`data_mut()`](Self::data_mut),
     /// [`data_as_u8_slice_mut()`](Self::data_as_u8_slice_mut), or [`set_pixel()`](Self::set_pixel).
-    may_have_opacities: bool,
+    may_have_transparency: bool,
+}
+
+/// A mutable view into premultiplied RGBA8 pixmap data.
+#[derive(Debug)]
+pub struct PixmapMut<'a> {
+    /// Width of the pixmap in pixels.
+    width: u16,
+    /// Height of the pixmap in pixels.
+    height: u16,
+    /// Buffer of the pixmap in RGBA8 format.
+    buf: &'a mut [u8],
+}
+
+impl<'a> PixmapMut<'a> {
+    /// Create a new mutable pixmap view.
+    ///
+    /// Returns `None` if `buf` is not exactly `width * height * 4` bytes long.
+    pub fn new(width: u16, height: u16, buf: &'a mut [u8]) -> Option<Self> {
+        if buf.len() == usize::from(width) * usize::from(height) * 4 {
+            Some(Self { width, height, buf })
+        } else {
+            None
+        }
+    }
+
+    /// Return the width of the pixmap.
+    pub fn width(&self) -> u16 {
+        self.width
+    }
+
+    /// Return the height of the pixmap.
+    pub fn height(&self) -> u16 {
+        self.height
+    }
+
+    /// Returns a mutable reference to the underlying data as premultiplied RGBA8 bytes.
+    pub fn data_mut(&mut self) -> &mut [u8] {
+        self.buf
+    }
+}
+
+impl<'a> From<&'a mut Pixmap> for PixmapMut<'a> {
+    fn from(pixmap: &'a mut Pixmap) -> Self {
+        pixmap.as_mut()
+    }
 }
 
 impl Pixmap {
@@ -39,7 +84,7 @@ impl Pixmap {
             width,
             height,
             buf,
-            may_have_opacities: true,
+            may_have_transparency: true,
         }
     }
 
@@ -76,7 +121,7 @@ impl Pixmap {
         data: Vec<PremulRgba8>,
         width: u16,
         height: u16,
-        may_have_opacities: bool,
+        may_have_transparency: bool,
     ) -> Self {
         assert_eq!(
             data.len(),
@@ -87,7 +132,7 @@ impl Pixmap {
             width,
             height,
             buf: data,
-            may_have_opacities,
+            may_have_transparency,
         }
     }
 
@@ -101,7 +146,7 @@ impl Pixmap {
         let new_len = usize::from(width) * usize::from(height);
         // If we're growing, new pixels are transparent black
         if new_len > self.buf.len() {
-            self.may_have_opacities = true;
+            self.may_have_transparency = true;
         }
         self.width = width;
         self.height = height;
@@ -137,28 +182,28 @@ impl Pixmap {
     /// modified directly via [`data_mut()`](Self::data_mut),
     /// [`data_as_u8_slice_mut()`](Self::data_as_u8_slice_mut), or [`set_pixel()`](Self::set_pixel).
     ///
-    /// Use [`set_may_have_opacities()`](Self::set_may_have_opacities) to manually update the flag,
-    /// or [`recompute_may_have_opacities()`](Self::recompute_may_have_opacities) to recalculate it
+    /// Use [`set_may_have_transparency()`](Self::set_may_have_transparency) to manually update the flag,
+    /// or [`recompute_may_have_transparency()`](Self::recompute_may_have_transparency) to recalculate it
     /// by scanning all pixels.
-    pub fn may_have_opacities(&self) -> bool {
-        self.may_have_opacities
+    pub fn may_have_transparency(&self) -> bool {
+        self.may_have_transparency
     }
 
-    /// Manually set the `may_have_opacities` flag.
+    /// Manually set the `may_have_transparency` flag.
     ///
     /// Use this after modifying pixels via [`data_mut()`](Self::data_mut) or
     /// [`set_pixel()`](Self::set_pixel) when you know whether the image has
     /// non-opaque pixels.
-    pub fn set_may_have_opacities(&mut self, may_have_opacities: bool) {
-        self.may_have_opacities = may_have_opacities;
+    pub fn set_may_have_transparency(&mut self, may_have_transparency: bool) {
+        self.may_have_transparency = may_have_transparency;
     }
 
-    /// Recalculate `may_have_opacities` by scanning all pixels.
+    /// Recalculate `may_have_transparency` by scanning all pixels.
     ///
     /// Use this after modifying pixels via [`data_mut()`](Self::data_mut) or
     /// [`set_pixel()`](Self::set_pixel) when you need accurate opacity information.
-    pub fn recompute_may_have_opacities(&mut self) {
-        self.may_have_opacities = self.buf.iter().any(|pixel| pixel.a != 255);
+    pub fn recompute_may_have_transparency(&mut self) {
+        self.may_have_transparency = self.buf.iter().any(|pixel| pixel.a != 255);
     }
 
     /// Apply an alpha value to the whole pixmap.
@@ -178,9 +223,9 @@ impl Pixmap {
             };
         }
 
-        // If we applied a non-opaque alpha, the image now has opacities
+        // If we applied a non-opaque alpha, the image now has transparency
         if alpha != 255 {
-            self.may_have_opacities = true;
+            self.may_have_transparency = true;
         }
     }
 
@@ -253,11 +298,11 @@ impl Pixmap {
             }
         };
 
-        let mut may_have_opacities = false;
+        let mut may_have_transparency = false;
         for pixel in pixmap.data_mut() {
             let alpha = pixel.a;
             if alpha != 255 {
-                may_have_opacities = true;
+                may_have_transparency = true;
             }
             let alpha_u16 = u16::from(alpha);
             #[expect(
@@ -269,7 +314,7 @@ impl Pixmap {
             pixel.g = premultiply(pixel.g);
             pixel.b = premultiply(pixel.b);
         }
-        pixmap.may_have_opacities = may_have_opacities;
+        pixmap.may_have_transparency = may_have_transparency;
 
         Ok(pixmap)
     }
@@ -293,6 +338,10 @@ impl Pixmap {
         &self.buf
     }
 
+    // TODO: Now that we have `as_mut`, maybe we don't need the
+    // mutable methods. If we add a `PixmapRef` we can also remove the
+    // non-mutable ones.
+
     /// Returns a mutable reference to the underlying data as premultiplied RGBA8.
     ///
     /// The pixels are in row-major order.
@@ -314,6 +363,15 @@ impl Pixmap {
     /// `[r, g, b, a]`.
     pub fn data_as_u8_slice_mut(&mut self) -> &mut [u8] {
         bytemuck::cast_slice_mut(&mut self.buf)
+    }
+
+    /// Return a mutable view into this pixmap's pixel data.
+    pub fn as_mut(&mut self) -> PixmapMut<'_> {
+        PixmapMut {
+            width: self.width,
+            height: self.height,
+            buf: bytemuck::cast_slice_mut(&mut self.buf),
+        }
     }
 
     /// Sample a pixel from the pixmap.

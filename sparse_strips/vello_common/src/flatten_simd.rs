@@ -10,6 +10,8 @@ use crate::kurbo::common::FloatFuncs as _;
 use crate::kurbo::{CubicBez, Line, ParamCurve, ParamCurveNearest, PathEl, Point, QuadBez};
 use crate::{
     flatten::{SQRT_TOL, TOL, TOL_2},
+    geometry::RectU16,
+    kurbo::Affine,
     tile::Tile,
 };
 use alloc::vec::Vec;
@@ -47,9 +49,14 @@ pub(crate) trait Callback {
 pub(crate) fn flatten<S: Simd>(
     simd: S,
     path: impl IntoIterator<Item = PathEl>,
+    // Note: we explicitly pass the `Affine` here instead of using `map` on
+    // the iterator because it seems like the `map` function isn't always inlined
+    // properly, even when annotating the closure with `#[inline(always)]`.
+    // See https://github.com/linebender/vello/pull/1600.
+    affine: Affine,
     callback: &mut impl Callback,
     flatten_ctx: &mut FlattenCtx,
-    cull_bbox: [u16; 4],
+    cull_bbox: RectU16,
 ) {
     flatten_ctx.flattened_cubics.clear();
 
@@ -73,15 +80,16 @@ pub(crate) fn flatten<S: Simd>(
     // rendered at all, there will be other geometry above that edge of the cull bbox. If that
     // geometry extends above the row, there will be coarse winding for a sparse fill. If not, it
     // there will be geometry to generate the intermediate tiles.
-    let left = cull_bbox[0] as f64;
-    let top = ((cull_bbox[1] / Tile::HEIGHT) * Tile::HEIGHT) as f64;
-    let right = cull_bbox[2] as f64;
-    let bottom = cull_bbox[3] as f64;
+    let left = cull_bbox.x0 as f64;
+    let top = ((cull_bbox.y0 / Tile::HEIGHT) * Tile::HEIGHT) as f64;
+    let right = cull_bbox.x1 as f64;
+    let bottom = cull_bbox.y1 as f64;
 
     let mut path = path.into_iter();
     let Some(first_el) = path.next() else {
         return;
     };
+    let first_el = affine * first_el;
     let PathEl::MoveTo(start_pt) = first_el else {
         debug_assert!(
             matches!(first_el, PathEl::MoveTo(_)),
@@ -95,7 +103,7 @@ pub(crate) fn flatten<S: Simd>(
     callback.callback(LinePathEl::MoveTo(start_pt));
 
     for el in path {
-        match el {
+        match affine * el {
             PathEl::MoveTo(p) => {
                 if last_pt != start_pt {
                     callback.callback(LinePathEl::LineTo(start_pt));
@@ -448,13 +456,13 @@ fn eval_cubics_simd<S: Simd>(simd: S, c: &CubicBez, n: usize, result: &mut Flatt
 
         let (low, high) = simd.split_f32x8(evaluated);
 
-        even_pts[i * 4..][..4].copy_from_slice(low.as_slice());
-        odd_pts[i * 4..][..4].copy_from_slice(high.as_slice());
+        low.store_slice(&mut even_pts[i * 4..][..4]);
+        high.store_slice(&mut odd_pts[i * 4..][..4]);
 
         t += t_inc;
     }
 
-    even_pts[n * 2..][..8].copy_from_slice(p3_128.as_slice());
+    p3_128.store_slice(&mut even_pts[n * 2..][..8]);
 }
 
 #[inline(always)]
@@ -472,7 +480,7 @@ fn estimate_subdiv_simd<S: Simd>(simd: S, sqrt_tol: f32, ctx: &mut FlattenCtx) {
         let x1 = p_onehalf.mul_add(2.0, x);
         let p1 = p2.mul_add(-0.5, x1);
 
-        odd_pts[(i * 8)..][..8].copy_from_slice(p1.as_slice());
+        p1.store_slice(&mut odd_pts[(i * 8)..][..8]);
 
         let d01 = p1 - p0;
         let d12 = p2 - p1;
@@ -528,11 +536,11 @@ fn estimate_subdiv_simd<S: Simd>(simd: S, sqrt_tol: f32, ctx: &mut FlattenCtx) {
         let uscale_a = u2 - u0;
         let uscale = 1.0 / uscale_a;
 
-        ctx.a0[i * 4..][..4].copy_from_slice(a0.as_slice());
-        ctx.da[i * 4..][..4].copy_from_slice(da.as_slice());
-        ctx.u0[i * 4..][..4].copy_from_slice(u0.as_slice());
-        ctx.uscale[i * 4..][..4].copy_from_slice(uscale.as_slice());
-        ctx.val[i * 4..][..4].copy_from_slice(val.as_slice());
+        a0.store_slice(&mut ctx.a0[i * 4..][..4]);
+        da.store_slice(&mut ctx.da[i * 4..][..4]);
+        u0.store_slice(&mut ctx.u0[i * 4..][..4]);
+        uscale.store_slice(&mut ctx.uscale[i * 4..][..4]);
+        val.store_slice(&mut ctx.val[i * 4..][..4]);
     }
 }
 
@@ -570,7 +578,7 @@ fn output_lines_simd<S: Simd>(
         let u = approx_parabola_inv_integral_simd(a);
         let t = (u - u0) * uscale;
         let p = coeff_a.mul_add(t, coeff_b).mul_add(t, coeff_c);
-        out[j * 8..][..8].copy_from_slice(p.as_slice());
+        p.store_slice(&mut out[j * 8..][..8]);
         a += a_inc;
     }
 }

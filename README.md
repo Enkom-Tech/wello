@@ -2,7 +2,7 @@
 
 **[Enkom-Tech/wello](https://github.com/Enkom-Tech/wello)** is Enkom’s maintained fork of [linebender/vello](https://github.com/linebender/vello). We merge upstream selectively, keep Enkom-specific changes here when needed, and target the **WAPP** viewer/browser stack with **wgpu / naga 29.x** (see [WAPP-SDK](https://github.com/Enkom-Tech/wapp-sdk)). This is not a mirror of upstream. Upstream design discussion belongs on [Linebender’s repo](https://github.com/linebender/vello) and [Zulip](https://xi.zulipchat.com/#narrow/channel/197075-vello); use this repo for fork-specific issues and PRs.
 
-The published Rust crate name remains **`vello`** (workspace version **0.8.0**). API-focused notes also live in [`vello/README.md`](vello/README.md).
+The published Rust crate name remains **`vello`** (workspace version **0.9.0**). API-focused notes also live in [`vello/README.md`](vello/README.md).
 
 ### Workspace layout (high level)
 
@@ -12,7 +12,6 @@ The published Rust crate name remains **`vello`** (workspace version **0.8.0**).
 | `examples/` | `with_winit`, `simple`, `headless`, WASM helpers, shared `scenes` |
 | `sparse_strips/` | Experimental CPU / hybrid / sparse-strip pipelines (`vello_cpu`, `vello_hybrid`, …) |
 | `glifo` | Glyph-related utilities used by the workspace |
-| `image_filters/vello_filters_cpu` | CPU-side image filters |
 | `vello_tests`, `xtask` | Tests and maintenance tooling |
 
 ### Use as a Cargo `git` dependency (no `[patch.crates-io]`)
@@ -25,7 +24,7 @@ vello = { git = "https://github.com/Enkom-Tech/wello", package = "vello", rev = 
 # Or, for a moving target: branch = "main"  (not recommended for releases)
 ```
 
-Pin **`rev`** to a commit SHA or use **`tag = "..."`** for reproducible builds. Align your own **`wgpu`** dependency with the version declared in this repo’s root `Cargo.toml` under `[workspace.dependencies]` (currently **29.0.1**) so types match across your app and Vello.
+Pin **`rev`** to a commit SHA or use **`tag = "..."`** for reproducible builds. Align your own **`wgpu`** dependency with the version declared in this repo’s root `Cargo.toml` under `[workspace.dependencies]` (currently **29.0.3**) so types match across your app and Vello.
 
 ---
 
@@ -38,7 +37,7 @@ Pin **`rev`** to a commit SHA or use **`tag = "..."`** for reproducible builds. 
 [![Linebender Zulip](https://img.shields.io/badge/Linebender-%23vello-blue?logo=Zulip)](https://xi.zulipchat.com/#narrow/channel/197075-vello)
 [![Upstream Vello (deps.rs)](https://deps.rs/repo/github/linebender/vello/status.svg)](https://deps.rs/repo/github/linebender/vello)
 [![Apache 2.0 or MIT license.](https://img.shields.io/badge/license-Apache--2.0_OR_MIT-blue.svg)](#license)
-[![wgpu version](https://img.shields.io/badge/wgpu-v29.0.1-orange.svg)](https://crates.io/crates/wgpu)
+[![wgpu version](https://img.shields.io/badge/wgpu-v29.0.3-orange.svg)](https://crates.io/crates/wgpu)
 
 [![Crates.io](https://img.shields.io/crates/v/vello.svg)](https://crates.io/crates/vello)
 [![Docs](https://docs.rs/vello/badge.svg)](https://docs.rs/vello)
@@ -242,7 +241,7 @@ VELLO_STATIC_LOG="vello=trace" VELLO_STATIC_ARGS="--test-scenes" cargo apk run -
 
 ## Minimum supported Rust Version (MSRV)
 
-This workspace is verified against **Rust 1.92** and later (see `rust-version` in the root `Cargo.toml` and `RUST_MIN_VER` in [`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
+This workspace is verified against **Rust 1.88** and later (see `rust-version` in the root `Cargo.toml` and `RUST_MIN_VER` in [`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
 
 Future toolchain bumps may land without a semver-major release, consistent with upstream policy.
 

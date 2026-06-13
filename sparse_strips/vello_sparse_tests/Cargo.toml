@@ -14,9 +14,13 @@ autotests = false
 name = "tests"
 path = "tests/mod.rs"
 
+[[bin]]
+name = "regenerate_probe_reference"
+path = "src/regenerate_probe_reference.rs"
+
 [dependencies]
-vello_api = { workspace = true }
-vello_common = { workspace = true, features = ["std"] }
+glifo = { workspace = true }
+vello_common = { workspace = true, features = ["std", "probe"] }
 vello_cpu = { workspace = true, features = ["multithreading", "std", "f32_pipeline"] }
 vello_hybrid = { workspace = true }
 fearless_simd = { workspace = true, features = [
@@ -36,8 +40,8 @@ smallvec = { workspace = true }
 oxipng = { workspace = true, features = ["freestanding", "parallel"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-wasm-bindgen-test = "0.3.67"
-web-sys = { version = "0.3.94", features = [
+wasm-bindgen-test = "0.3.71"
+web-sys = { version = "0.3.98", features = [
     "HtmlCanvasElement",
     "WebGl2RenderingContext",
     "Document",
@@ -50,13 +54,13 @@ web-sys = { version = "0.3.94", features = [
     "Url",
     "Response",
 ] }
-wasm-bindgen = "0.2.117"
-wasm-bindgen-futures = "0.4.67"
+wasm-bindgen = "0.2.121"
+wasm-bindgen-futures = "0.4.71"
 # Required for introspecting the built WASM binary.
 wasmparser = "0.246.1"
 
 [features]
-webgl = ["vello_hybrid/webgl"]
+webgl = ["vello_hybrid/webgl", "vello_hybrid/probe"]
 
 [lints]
 workspace = true

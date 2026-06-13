@@ -3,12 +3,20 @@
 
 //! Glifo provides APIs for efficiently rendering glyphs and paint styles like underline.
 //!
-//! ## Features
+//! # Goals
+//!
+//! Glifo is under rapid development. Consider it experimental for now. Its goals are to:
+//!
+//! - Provide an API surface that accepts glyphs and their positions and renders them to a surface.
+//! - Cache those glyphs so that repeated renders of a glyph are fast.
+//! - Support rendering paint styles like underline, strikethrough, and brush color.
+//! - Share expensive structs and data between the shaper and renderer like the hinting instance and hinted advance.
+//!
+//! # Features
 //!
 //! - `std` (enabled by default): Get floating point functions from the standard library
 //!   (likely using your target's libc).
 //! - `libm`: Use floating point implementations from `libm`.
-//! - `vello_cpu` (enabled by default): Implements `GlyphRenderer` for Vello CPU's `RenderContext`.
 //! - `png`: Enables PNG support for drawing bitmap glyphs.
 //!
 //! At least one of `std` and `libm` is required.
@@ -26,8 +34,11 @@
 #![no_std]
 
 extern crate alloc;
-#[cfg(feature = "libm")]
+#[cfg(all(feature = "std", feature = "libm"))]
 use core_maths as _;
+
+// Currently used for debugging in `cache.rs`, but only in debug build.
+use log as _;
 #[cfg(feature = "png")]
 use png as _;
 #[cfg(feature = "std")]
@@ -39,23 +50,17 @@ use vello_common::pixmap::Pixmap;
 pub mod atlas;
 mod colr;
 mod glyph;
-mod math;
-
-pub mod renderers;
+mod interface;
+pub mod renderer;
+mod util;
 
 pub use atlas::{
     AtlasCommand, AtlasCommandRecorder, AtlasConfig, AtlasPaint, AtlasSlot, GLYPH_PADDING,
-    GlyphAtlas, GlyphCache, GlyphCacheConfig, GlyphCacheKey, ImageCache, PendingClearRect,
-    RasterMetrics,
+    GlyphAtlas, GlyphCacheConfig, GlyphCacheKey, ImageCache, PendingClearRect, RasterMetrics,
 };
-pub use colr::{ColrPainter, ColrRenderer};
 pub use glyph::{
-    CachedGlyphType, Glyph, GlyphBitmap, GlyphCaches, GlyphColr, GlyphOutline, GlyphRenderer,
-    GlyphRunBuilder, GlyphRunRenderer, GlyphType, HintCache, HintKey, OutlineCache, PreparedGlyph,
+    AtlasCacher, FontEmbolden, Glyph, GlyphCaches, GlyphColr, GlyphPrepCache, GlyphPrepCacheMut,
+    GlyphRun, GlyphRunBackend, GlyphRunBuilder, GlyphRunRenderer, HintCache, HintKey,
+    NormalizedCoord, OutlineCache,
 };
-
-#[cfg(feature = "vello_cpu")]
-pub use renderers::vello_cpu::{CpuGlyphAtlas, CpuGlyphCaches};
-
-#[cfg(feature = "vello_hybrid")]
-pub use renderers::vello_hybrid::{GpuGlyphAtlas, GpuGlyphCaches};
+pub use interface::{DrawSink, GlyphRenderer};

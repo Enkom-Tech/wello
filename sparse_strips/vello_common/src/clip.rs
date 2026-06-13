@@ -3,6 +3,7 @@
 
 //! Managing clipping state.
 
+use crate::geometry::RectU16;
 use crate::kurbo::{Affine, BezPath, PathEl, Rect};
 use crate::strip::Strip;
 use crate::strip_generator::{GenerationMode, StripGenerator, StripStorage};
@@ -21,10 +22,10 @@ struct ClipData {
     alpha_start: u32,
     strip_start: u32,
 
-    /// A coarse bounding box of the clip path in pixel coordinates `[left, top, right, bottom]`.
+    /// A coarse bounding box of the clip path in pixel coordinates.
     ///
     /// These bounds have already been intersected with the viewport.
-    bbox: [u16; 4],
+    bbox: RectU16,
 }
 
 impl ClipData {
@@ -110,23 +111,20 @@ impl ClipContext {
         // could move this calculation into flattening (perhaps with a const-generic as to not
         // pessimize calls that don't require the bbox).
         let path_bbox = control_point_bbox(clip_path, transform);
-        let mut bbox = [
+        let mut bbox = RectU16::new(
             path_bbox.x0 as u16,
             path_bbox.y0 as u16,
             path_bbox.x1.ceil() as u16,
             path_bbox.y1.ceil() as u16,
-        ];
+        );
 
         // Intersect with the existing clip bounding box, or the viewport if this is the outermost
         // clip.
         if let Some(existing) = self.clip_stack.last() {
-            bbox[0] = bbox[0].max(existing.bbox[0]);
-            bbox[1] = bbox[1].max(existing.bbox[1]);
-            bbox[2] = bbox[2].min(existing.bbox[2]);
-            bbox[3] = bbox[3].min(existing.bbox[3]);
+            bbox = bbox.intersect(existing.bbox);
         } else {
-            bbox[2] = bbox[2].min(strip_generator.width());
-            bbox[3] = bbox[3].min(strip_generator.height());
+            bbox.x1 = bbox.x1.min(strip_generator.width());
+            bbox.y1 = bbox.y1.min(strip_generator.height());
         }
 
         let clip_data = ClipData {
@@ -203,10 +201,10 @@ pub struct PathDataRef<'a> {
     /// The alpha buffer.
     pub alphas: &'a [u8],
 
-    /// A coarse bounding box of the clip path in pixel coordinates `[left, top, right, bottom]`.
+    /// A coarse bounding box of the clip path in pixel coordinates.
     ///
     /// These bounds have already been intersected with the viewport.
-    pub bbox: [u16; 4],
+    pub bbox: RectU16,
 }
 
 /// Compute the sparse strips representation of a path that results
@@ -232,6 +230,7 @@ pub fn intersect(
 ///
 /// This is all that this method does. It just looks more complicated as the logic for iterating
 /// in lock step is a bit tricky.
+#[inline(always)]
 fn intersect_impl<S: Simd>(
     simd: S,
     path_1: PathDataRef<'_>,
@@ -245,13 +244,26 @@ fn intersect_impl<S: Simd>(
 
     // Ignore any y values that are outside the bounding box of either of the two paths, as
     // those are guaranteed to have neither fill nor strip regions.
-    let mut cur_y = path_1.strips[0].strip_y().min(path_2.strips[0].strip_y());
+    let path_1_start_y = path_1.strips[0].strip_y();
+    let path_2_start_y = path_2.strips[0].strip_y();
+    let mut cur_y = path_1_start_y.max(path_2_start_y);
     let end_y = path_1.strips[path_1.strips.len() - 1]
         .strip_y()
         .min(path_2.strips[path_2.strips.len() - 1].strip_y());
 
     let mut path_1_idx = 0;
     let mut path_2_idx = 0;
+
+    // Use binary search to determine the first index of whichever
+    // path has a smaller y to avoid a large linear scan in the
+    // first iteration of the loop below in case the discrepancy
+    // is large.
+    if path_1_start_y < cur_y {
+        path_1_idx = first_strip_at_or_after(path_1.strips, cur_y);
+    } else if path_2_start_y < cur_y {
+        path_2_idx = first_strip_at_or_after(path_2.strips, cur_y);
+    }
+
     let mut strip_state = None;
 
     // Iterate over each strip row and handle them.
@@ -352,13 +364,22 @@ fn intersect_impl<S: Simd>(
         cur_y += 1;
     }
 
-    // Push the sentinel strip.
-    target.strips.push(Strip::new(
-        u16::MAX,
-        end_y * Tile::HEIGHT,
-        target.alphas.len() as u32,
-        false,
-    ));
+    // Push the sentinel strip, if one wasn't already pushed.
+    if !target.strips.last().is_some_and(Strip::is_sentinel) {
+        target.strips.push(Strip::new(
+            u16::MAX,
+            end_y * Tile::HEIGHT,
+            target.alphas.len() as u32,
+            false,
+        ));
+    }
+}
+
+#[inline(always)]
+fn first_strip_at_or_after(strips: &[Strip], strip_y: u16) -> usize {
+    // Strips are guaranteed to be sorted in ascending y (and ascending x),
+    // hence why we can do this.
+    strips.partition_point(|strip| strip.strip_y() < strip_y)
 }
 
 /// An overlap between two regions.
@@ -519,7 +540,7 @@ impl<'a> RowIterator<'a> {
             let x = cur.x + self.cur_strip_width();
             let width = next.x - x;
 
-            Some(FillRegion { start: x, width })
+            (width > 0).then_some(FillRegion { start: x, width })
         } else {
             None
         }
@@ -613,7 +634,8 @@ fn should_create_new_strip(
 
 #[cfg(test)]
 mod tests {
-    use crate::clip::{PathDataRef, RowIterator, intersect};
+    use crate::clip::{PathDataRef, Region, RowIterator, first_strip_at_or_after, intersect};
+    use crate::geometry::RectU16;
     use crate::strip::Strip;
     use crate::strip_generator::StripStorage;
     use crate::tile::Tile;
@@ -703,6 +725,27 @@ mod tests {
     }
 
     #[test]
+    fn first_strip_at_or_after_returns_first_matching_strip_y() {
+        let path = StripBuilder::new()
+            .add_strip(0, 0, 4, false)
+            .add_strip(0, 2, 4, false)
+            .add_strip(8, 2, 12, false)
+            .add_strip(16, 2, 20, false)
+            .add_strip(0, 4, 4, false)
+            .add_strip(8, 4, 12, false)
+            .add_strip(0, 6, 4, false)
+            .finish();
+
+        assert_eq!(first_strip_at_or_after(&path.strips, 0), 0);
+        assert_eq!(first_strip_at_or_after(&path.strips, 2), 1);
+        assert_eq!(first_strip_at_or_after(&path.strips, 3), 4);
+        assert_eq!(first_strip_at_or_after(&path.strips, 4), 4);
+        assert_eq!(first_strip_at_or_after(&path.strips, 5), 6);
+        assert_eq!(first_strip_at_or_after(&path.strips, 6), 6);
+        assert_eq!(first_strip_at_or_after(&path.strips, 7), path.strips.len());
+    }
+
+    #[test]
     fn row_iterator_abort_next_line() {
         let path_1 = StripBuilder::new()
             .add_strip(0, 0, 4, false)
@@ -712,7 +755,7 @@ mod tests {
         let path_ref = PathDataRef {
             strips: &path_1.strips,
             alphas: &path_1.alphas,
-            bbox: [0, 0, u16::MAX, u16::MAX],
+            bbox: RectU16::new(0, 0, u16::MAX, u16::MAX),
         };
 
         let mut idx = 0;
@@ -722,24 +765,182 @@ mod tests {
         assert!(iter.next().is_none());
     }
 
+    #[test]
+    fn row_iterator_sentinel_fill_gap() {
+        let path = StripBuilder::new()
+            .add_strip(0, 0, Tile::WIDTH, false)
+            .finish_with_fill_gap_sentinel();
+        let path_ref = path_ref(&path);
+
+        let mut idx = 0;
+        let mut iter = RowIterator::new(path_ref, &mut idx, 0);
+
+        assert_strip_region(iter.next(), 0, Tile::WIDTH);
+        assert_fill_region(iter.next(), Tile::WIDTH, u16::MAX - Tile::WIDTH);
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn intersect_strip_with_sentinel_fill_gap() {
+        let path_1 = StripBuilder::new()
+            .add_strip(0, 0, Tile::WIDTH, false)
+            .finish_with_fill_gap_sentinel();
+        let path_2 = StripBuilder::new().add_strip(8, 0, 12, false).finish();
+        let expected = StripBuilder::new().add_strip(8, 0, 12, false).finish();
+
+        run_test(expected, path_1, path_2);
+    }
+
+    #[test]
+    fn intersect_two_sentinel_fill_gaps() {
+        let path_1 = StripBuilder::new()
+            .add_strip(0, 0, 8, false)
+            .finish_with_fill_gap_sentinel();
+        let path_2 = StripBuilder::new()
+            .add_strip(4, 0, 12, false)
+            .finish_with_fill_gap_sentinel();
+        let expected = StripBuilder::new()
+            .add_strip(4, 0, 12, false)
+            .finish_with_fill_gap_sentinel();
+
+        run_test(expected, path_1, path_2);
+    }
+
+    #[test]
+    fn row_iterator_fill_gap_stops_at_row_boundary() {
+        let mut path = StripBuilder::new()
+            .add_strip(0, 0, 4, false)
+            .finish_with_fill_gap_sentinel();
+        let idx = path.alphas.len();
+        path.strips
+            .push(Strip::new(0, Tile::HEIGHT, idx as u32, false));
+        path.alphas
+            .extend([0; Tile::HEIGHT as usize * Tile::WIDTH as usize]);
+        path.strips.push(Strip::new(
+            u16::MAX,
+            Tile::HEIGHT,
+            path.alphas.len() as u32,
+            false,
+        ));
+
+        let path_ref = path_ref(&path);
+        let mut idx = 0;
+        let mut iter = RowIterator::new(path_ref, &mut idx, 0);
+
+        assert_strip_region(iter.next(), 0, 4);
+        assert_fill_region(iter.next(), 4, u16::MAX - 4);
+        assert!(iter.next().is_none());
+
+        let mut iter = RowIterator::new(path_ref, &mut idx, 1);
+
+        assert_strip_region(iter.next(), 0, Tile::WIDTH);
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn row_iterator_adjacent_unmerged_strips_no_fill() {
+        let path = StripBuilder::new()
+            .add_strip(0, 0, 4, false)
+            .add_strip(4, 0, 8, false)
+            .finish();
+        let path_ref = path_ref(&path);
+
+        let mut idx = 0;
+        let mut iter = RowIterator::new(path_ref, &mut idx, 0);
+
+        assert_strip_region(iter.next(), 0, 4);
+        assert_strip_region(iter.next(), 4, 4);
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn row_iterator_adjacent_unmerged_strips_with_fill_gap() {
+        let path = StripBuilder::new()
+            .add_strip(0, 0, 4, false)
+            .add_strip(4, 0, 8, true)
+            .finish();
+        let path_ref = path_ref(&path);
+
+        let mut idx = 0;
+        let mut iter = RowIterator::new(path_ref, &mut idx, 0);
+
+        assert_strip_region(iter.next(), 0, 4);
+        assert_strip_region(iter.next(), 4, 4);
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn intersect_adjacent_unmerged_strips() {
+        let path = StripBuilder::new()
+            .add_strip(0, 0, 4, false)
+            .add_strip(4, 0, 8, true)
+            .finish();
+        let cover = StripBuilder::new().add_strip(0, 0, 8, false).finish();
+        let expected = StripBuilder::new().add_strip(0, 0, 8, false).finish();
+
+        run_test(expected, path, cover);
+    }
+
+    #[test]
+    fn row_iterator_zero_width_alpha_region() {
+        let mut path = StripStorage::default();
+        path.strips.push(Strip::new(8, 0, 0, false));
+        path.strips.push(Strip::new(16, 0, 0, true));
+        path.strips.push(Strip::new(u16::MAX, 0, 0, false));
+        let path_ref = path_ref(&path);
+
+        let mut idx = 0;
+        let iter = RowIterator::new(path_ref, &mut idx, 0);
+
+        assert_eq!(iter.cur_strip_width(), 0);
+        let fill = iter.cur_strip_fill_area().unwrap();
+        assert_eq!(fill.start, 8);
+        assert_eq!(fill.width, 8);
+
+        let cover = StripBuilder::new().add_strip(0, 0, 20, false).finish();
+        let expected = StripBuilder::new().add_strip(8, 0, 16, false).finish();
+
+        run_test(expected, path, cover);
+    }
+
     fn run_test(expected: StripStorage, path_1: StripStorage, path_2: StripStorage) {
         let mut write_target = StripStorage::default();
 
-        let path_1 = PathDataRef {
-            strips: &path_1.strips,
-            alphas: &path_1.alphas,
-            bbox: [0, 0, u16::MAX, u16::MAX],
-        };
-
-        let path_2 = PathDataRef {
-            strips: &path_2.strips,
-            alphas: &path_2.alphas,
-            bbox: [0, 0, u16::MAX, u16::MAX],
-        };
+        let path_1 = path_ref(&path_1);
+        let path_2 = path_ref(&path_2);
 
         intersect(Level::new(), path_1, path_2, &mut write_target);
 
         assert_eq!(write_target, expected);
+    }
+
+    fn path_ref(path: &StripStorage) -> PathDataRef<'_> {
+        PathDataRef {
+            strips: &path.strips,
+            alphas: &path.alphas,
+            bbox: RectU16::new(0, 0, u16::MAX, u16::MAX),
+        }
+    }
+
+    fn assert_strip_region(region: Option<Region<'_>>, start: u16, width: u16) {
+        match region {
+            Some(Region::Strip(strip)) => {
+                assert_eq!(strip.start, start);
+                assert_eq!(strip.width, width);
+                assert_eq!(strip.alphas.len(), (width * Tile::HEIGHT) as usize);
+            }
+            other => panic!("expected strip region, got {other:?}"),
+        }
+    }
+
+    fn assert_fill_region(region: Option<Region<'_>>, start: u16, width: u16) {
+        match region {
+            Some(Region::Fill(fill)) => {
+                assert_eq!(fill.start, start);
+                assert_eq!(fill.width, width);
+            }
+            other => panic!("expected fill region, got {other:?}"),
+        }
     }
 
     struct StripBuilder {
@@ -790,6 +991,17 @@ mod tests {
             self.storage
                 .strips
                 .push(Strip::new(u16::MAX, last_y, idx as u32, false));
+
+            self.storage
+        }
+
+        fn finish_with_fill_gap_sentinel(mut self) -> StripStorage {
+            let last_y = self.storage.strips.last().unwrap().y;
+            let idx = self.storage.alphas.len();
+
+            self.storage
+                .strips
+                .push(Strip::new(u16::MAX, last_y, idx as u32, true));
 
             self.storage
         }

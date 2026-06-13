@@ -20,16 +20,21 @@ pub(crate) struct GradientPainter<'a, S: Simd> {
 
 impl<'a, S: Simd> GradientPainter<'a, S> {
     pub(crate) fn new(simd: S, gradient: &'a EncodedGradient, t_vals: &'a [f32]) -> Self {
-        let lut = gradient.u8_lut(simd);
-        let scale_factor = f32x16::splat(simd, lut.scale_factor());
+        simd.vectorize(
+            #[inline(always)]
+            || {
+                let lut = gradient.u8_lut(simd);
+                let scale_factor = f32x16::splat(simd, lut.scale_factor());
 
-        Self {
-            gradient,
-            scale_factor,
-            lut: lut.lut(),
-            t_vals: t_vals.chunks_exact(16),
-            simd,
-        }
+                Self {
+                    gradient,
+                    scale_factor,
+                    lut: lut.lut(),
+                    t_vals: t_vals.chunks_exact(16),
+                    simd,
+                }
+            },
+        )
     }
 }
 
@@ -58,7 +63,7 @@ impl<S: Simd> crate::fine::Painter for GradientPainter<'_, S> {
             #[inline(always)]
             || {
                 for chunk in buf.chunks_exact_mut(64) {
-                    chunk.copy_from_slice(self.next().unwrap().as_slice());
+                    self.next().unwrap().store_slice(chunk);
                 }
             },
         );

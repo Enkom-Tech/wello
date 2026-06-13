@@ -16,7 +16,7 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::Window;
 
-use vello::wgpu;
+use vello::wgpu::{self, CurrentSurfaceTexture};
 
 #[derive(Debug)]
 enum RenderState {
@@ -95,12 +95,12 @@ impl ApplicationHandler for SimpleVelloApp {
         event: WindowEvent,
     ) {
         // Only process events for our window, and only when we have a surface.
-        let (surface, valid_surface) = match &mut self.state {
+        let (surface, valid_surface, _window) = match &mut self.state {
             RenderState::Active {
                 surface,
                 valid_surface,
                 window,
-            } if window.id() == window_id => (surface, valid_surface),
+            } if window.id() == window_id => (surface, valid_surface, window),
             _ => return,
         };
 
@@ -159,18 +159,18 @@ impl ApplicationHandler for SimpleVelloApp {
 
                 let (surface_texture, reconfigure_after) =
                     match surface.surface.get_current_texture() {
-                        wgpu::CurrentSurfaceTexture::Success(st) => (st, false),
-                        wgpu::CurrentSurfaceTexture::Suboptimal(st) => (st, true),
-                        wgpu::CurrentSurfaceTexture::Timeout
-                        | wgpu::CurrentSurfaceTexture::Occluded => return,
-                        wgpu::CurrentSurfaceTexture::Outdated
-                        | wgpu::CurrentSurfaceTexture::Lost => {
-                            surface
-                                .surface
-                                .configure(&device_handle.device, &surface.config);
+                        CurrentSurfaceTexture::Success(st) => (st, false),
+                        CurrentSurfaceTexture::Suboptimal(st) => (st, true),
+                        CurrentSurfaceTexture::Outdated => {
+                            self.context.configure_surface(surface);
                             return;
                         }
-                        wgpu::CurrentSurfaceTexture::Validation => return,
+                        CurrentSurfaceTexture::Timeout | CurrentSurfaceTexture::Occluded => return,
+                        CurrentSurfaceTexture::Lost => {
+                            self.context.configure_surface(surface);
+                            return;
+                        }
+                        CurrentSurfaceTexture::Validation => return,
                     };
 
                 // Perform the copy
@@ -192,9 +192,7 @@ impl ApplicationHandler for SimpleVelloApp {
                 // Queue the texture to be presented on the surface
                 surface_texture.present();
                 if reconfigure_after {
-                    surface
-                        .surface
-                        .configure(&device_handle.device, &surface.config);
+                    self.context.configure_surface(surface);
                 }
 
                 device_handle.device.poll(wgpu::PollType::Poll).unwrap();

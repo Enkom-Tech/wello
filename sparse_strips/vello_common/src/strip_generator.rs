@@ -6,6 +6,7 @@
 use crate::clip::{PathDataRef, intersect};
 use crate::fearless_simd::Level;
 use crate::flatten::{FlattenCtx, Line};
+use crate::geometry::RectU16;
 use crate::kurbo::{Affine, PathEl, Rect, Stroke};
 use crate::peniko::Fill;
 use crate::strip::Strip;
@@ -94,7 +95,7 @@ impl StripGenerator {
         Self {
             level,
             line_buf: Vec::new(),
-            tiles: Tiles::new(level),
+            tiles: Tiles::new(level, height),
             flatten_ctx: FlattenCtx::default(),
             stroke_ctx: StrokeCtx::default(),
             temp_storage: StripStorage::default(),
@@ -125,10 +126,9 @@ impl StripGenerator {
         strip_storage: &mut StripStorage,
         clip_path: Option<PathDataRef<'_>>,
     ) {
-        let cull_bbox =
-            clip_path
-                .map(|clip_path| clip_path.bbox)
-                .unwrap_or([0, 0, self.width, self.height]);
+        let cull_bbox = clip_path
+            .map(|clip_path| clip_path.bbox)
+            .unwrap_or(RectU16::new(0, 0, self.width, self.height));
         flatten::fill(
             self.level,
             path,
@@ -151,10 +151,9 @@ impl StripGenerator {
         strip_storage: &mut StripStorage,
         clip_path: Option<PathDataRef<'_>>,
     ) {
-        let cull_bbox =
-            clip_path
-                .map(|clip_path| clip_path.bbox)
-                .unwrap_or([0, 0, self.width, self.height]);
+        let cull_bbox = clip_path
+            .map(|clip_path| clip_path.bbox)
+            .unwrap_or(RectU16::new(0, 0, self.width, self.height));
         flatten::stroke(
             self.level,
             path,
@@ -176,7 +175,8 @@ impl StripGenerator {
         clip_path: Option<PathDataRef<'_>>,
     ) {
         self.tiles
-            .make_tiles_analytic_aa(&self.line_buf, self.width, self.height);
+            .make_tiles_analytic_aa(self.level, &self.line_buf, self.width, self.height);
+
         self.tiles.sort_tiles();
 
         let level = self.level;
@@ -212,8 +212,19 @@ impl StripGenerator {
         clip_path: Option<PathDataRef<'_>>,
     ) {
         let viewport = Rect::new(0.0, 0.0, self.width as f64, self.height as f64);
-
-        let clamped = rect.intersect(viewport);
+        let clip_bbox = clip_path
+            .map(|clip| {
+                // Clip bbox is always guaranteed to be within viewport bounds, so no need to
+                // intersect again.
+                Rect::new(
+                    f64::from(clip.bbox.x0),
+                    f64::from(clip.bbox.y0),
+                    f64::from(clip.bbox.x1),
+                    f64::from(clip.bbox.y1),
+                )
+            })
+            .unwrap_or(viewport);
+        let clamped = rect.abs().intersect(clip_bbox);
 
         let level = self.level;
         render_with_clip(
@@ -261,7 +272,7 @@ fn render_with_clip(
         let path_data = PathDataRef {
             strips: &temp_storage.strips,
             alphas: &temp_storage.alphas,
-            bbox: [0, 0, u16::MAX, u16::MAX],
+            bbox: RectU16::new(0, 0, u16::MAX, u16::MAX),
         };
         intersect(level, clip_path, path_data, strip_storage);
     } else {
@@ -420,5 +431,10 @@ mod tests {
                 assert_rect_fast_eq_path(rect, &format!("exhaustive_{dx}_{dy}"));
             }
         }
+    }
+
+    #[test]
+    fn rect_inverted_both_axes() {
+        assert_rect_fast_eq_path(Rect::new(18.0, 18.0, 2.0, 2.0), "inverted_both_axes");
     }
 }

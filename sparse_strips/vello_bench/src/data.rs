@@ -7,6 +7,7 @@ use usvg::tiny_skia_path::PathSegment;
 use usvg::{Group, Node};
 use vello_common::fearless_simd::Level;
 use vello_common::flatten::{FlattenCtx, Line};
+use vello_common::geometry::RectU16;
 use vello_common::kurbo::{Affine, BezPath, Stroke, StrokeCtx};
 use vello_common::peniko::Fill;
 use vello_common::strip::Strip;
@@ -86,7 +87,7 @@ impl DataItem {
                 path.transform,
                 &mut temp_buf,
                 &mut FlattenCtx::default(),
-                [0, 0, self.width, self.height],
+                RectU16::new(0, 0, self.width, self.height),
             );
             line_buf.extend(&temp_buf);
         }
@@ -104,7 +105,7 @@ impl DataItem {
                 &mut temp_buf,
                 &mut FlattenCtx::default(),
                 &mut StrokeCtx::default(),
-                [0, 0, self.width, self.height],
+                RectU16::new(0, 0, self.width, self.height),
             );
             line_buf.extend(&temp_buf);
         }
@@ -131,9 +132,9 @@ impl DataItem {
 
     /// Get the unsorted tiles.
     pub fn unsorted_tiles(&self) -> Tiles {
-        let mut tiles = Tiles::new(Level::new());
+        let mut tiles = Tiles::new(Level::new(), self.height);
         let lines = self.lines();
-        tiles.make_tiles_analytic_aa(&lines, self.width, self.height);
+        tiles.make_tiles_analytic_aa(Level::new(), &lines, self.width, self.height);
 
         tiles
     }

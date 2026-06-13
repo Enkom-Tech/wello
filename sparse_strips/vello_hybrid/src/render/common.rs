@@ -9,6 +9,7 @@
 )]
 
 use bytemuck::{Pod, Zeroable};
+use vello_common::multi_atlas::AtlasConfig;
 
 // GPU paint structure sizes in texels (1 texel = 16 bytes for RGBA32Uint texture format).
 pub(crate) const GPU_ENCODED_IMAGE_SIZE_TEXELS: u32 = (size_of::<GpuEncodedImage>() / 16) as u32;
@@ -17,10 +18,68 @@ pub(crate) const GPU_LINEAR_GRADIENT_SIZE_TEXELS: u32 =
 pub(crate) const GPU_RADIAL_GRADIENT_SIZE_TEXELS: u32 =
     (size_of::<GpuRadialGradient>() / 16) as u32;
 pub(crate) const GPU_SWEEP_GRADIENT_SIZE_TEXELS: u32 = (size_of::<GpuSweepGradient>() / 16) as u32;
+pub(crate) const GPU_BLURRED_ROUNDED_RECT_SIZE_TEXELS: u32 =
+    (size_of::<GpuBlurredRoundedRect>() / 16) as u32;
 
 // TODO: If we want to use native bilinear sampling for uploaded images,
 // we can pass 1 instead of 0 here.
 pub(crate) const IMAGE_PADDING: u16 = 0;
+
+pub(crate) fn normalize_atlas_config(
+    config: &mut AtlasConfig,
+    max_texture_dimension_2d: u32,
+    max_texture_array_layers: u32,
+    min_initial_atlas_count: usize,
+) {
+    config.atlas_size.0 = config.atlas_size.0.clamp(1, max_texture_dimension_2d);
+    config.atlas_size.1 = config.atlas_size.1.clamp(1, max_texture_dimension_2d);
+
+    let supported_max_atlases = (max_texture_array_layers as usize).max(min_initial_atlas_count);
+    config.max_atlases = config
+        .max_atlases
+        .clamp(min_initial_atlas_count, supported_max_atlases);
+    config.initial_atlas_count = config
+        .initial_atlas_count
+        .clamp(min_initial_atlas_count, config.max_atlases);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_atlas_config;
+    use vello_common::multi_atlas::AtlasConfig;
+
+    #[test]
+    fn normalize_atlas_config_clamps_to_backend_limits() {
+        let mut config = AtlasConfig {
+            initial_atlas_count: 8,
+            max_atlases: 16,
+            atlas_size: (8192, 2048),
+            ..Default::default()
+        };
+
+        normalize_atlas_config(&mut config, 4096, 4, 1);
+
+        assert_eq!(config.initial_atlas_count, 4);
+        assert_eq!(config.max_atlases, 4);
+        assert_eq!(config.atlas_size, (4096, 2048));
+    }
+
+    #[test]
+    fn normalize_atlas_config_enforces_minimum_initial_count() {
+        let mut config = AtlasConfig {
+            initial_atlas_count: 0,
+            max_atlases: 1,
+            atlas_size: (0, 0),
+            ..Default::default()
+        };
+
+        normalize_atlas_config(&mut config, 4096, 8, 2);
+
+        assert_eq!(config.initial_atlas_count, 2);
+        assert_eq!(config.max_atlases, 2);
+        assert_eq!(config.atlas_size, (1, 1));
+    }
+}
 
 /// Dimensions of the rendering target.
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -93,6 +152,10 @@ pub struct GpuStrip {
     pub payload: u32,
     /// See `StripInstance::paint_and_rect_flag` documentation in `render_strips.wgsl`.
     pub paint_and_rect_flag: u32,
+    /// Painter's-order index used to compute z-depth for early-z rejection in shader.
+    /// In other words, the back-most draw has index 0 and every additional draw in front
+    /// has an incrementing index.
+    pub depth_index: u32,
 }
 
 /// Different types of GPU encoded paints.
@@ -106,6 +169,8 @@ pub(crate) enum GpuEncodedPaint {
     RadialGradient(GpuRadialGradient),
     /// An encoded sweep gradient.
     SweepGradient(GpuSweepGradient),
+    /// An encoded blurred rounded rectangle.
+    BlurredRoundedRect(GpuBlurredRoundedRect),
 }
 
 impl GpuEncodedPaint {
@@ -117,6 +182,7 @@ impl GpuEncodedPaint {
             Self::LinearGradient(paint) => bytemuck::bytes_of(paint),
             Self::RadialGradient(paint) => bytemuck::bytes_of(paint),
             Self::SweepGradient(paint) => bytemuck::bytes_of(paint),
+            Self::BlurredRoundedRect(paint) => bytemuck::bytes_of(paint),
         }
     }
 
@@ -157,6 +223,28 @@ pub(crate) struct GpuEncodedImage {
     pub tint_mode: u32,
     /// Number of transparent padding pixels around the image in the atlas.
     pub image_padding: u32,
+}
+
+/// GPU encoded blurred rounded rectangle data.
+/// Align to 16 bytes for `RGBA32Uint` alignment.
+#[repr(C, align(16))]
+#[derive(Debug, Clone, Copy, Zeroable, Pod)]
+#[allow(dead_code, reason = "Clippy fails when --no-default-features")]
+pub(crate) struct GpuBlurredRoundedRect {
+    /// Transform matrix [a, b, c, d, tx, ty].
+    pub transform: [f32; 6],
+    /// Premultiplied color packed as RGBA8 unorm (`pack4x8unorm` layout).
+    pub color: u32,
+    /// Padding for 16-byte alignment.
+    pub _padding0: u32,
+    /// Blur parameters: exponent, reciprocal exponent, scale, and inverse standard deviation.
+    pub params0: [f32; 4],
+    /// Blur parameters: minimum edge length, adjusted width, adjusted height, and outer radius.
+    pub params1: [f32; 4],
+    /// Blur parameters [width, height].
+    pub size: [f32; 2],
+    /// Padding for 16-byte alignment.
+    pub _padding1: [u32; 2],
 }
 
 /// GPU encoded linear gradient data.
@@ -317,7 +405,7 @@ For optimal performance and binary size on web targets, use only the dedicated W
 }
 
 #[cfg(all(
-    any(all(target_arch = "wasm32", feature = "webgl"), feature = "wgpu"),
+    any(feature = "webgl", feature = "wgpu"),
     not(all(target_arch = "wasm32", feature = "webgl", feature = "wgpu"))
 ))]
 pub(crate) fn maybe_warn_about_webgl_feature_conflict() {}

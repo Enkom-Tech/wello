@@ -30,12 +30,18 @@ impl RenderContext {
         reason = "Creating a wgpu Instance is something which should only be done rarely"
     )]
     pub fn new() -> Self {
-        let mut instance_desc = wgpu::InstanceDescriptor::new_without_display_handle();
-        instance_desc.backends = wgpu::Backends::from_env().unwrap_or_default();
-        instance_desc.flags = wgpu::InstanceFlags::from_build_config().with_env();
-        instance_desc.memory_budget_thresholds = wgpu::MemoryBudgetThresholds::default();
-        instance_desc.backend_options = wgpu::BackendOptions::from_env_or_default();
-        let instance = Instance::new(instance_desc);
+        let backends = wgpu::Backends::from_env().unwrap_or_default();
+        let flags = wgpu::InstanceFlags::from_build_config().with_env();
+        let memory_budget_thresholds = wgpu::MemoryBudgetThresholds::default();
+        let backend_options = wgpu::BackendOptions::from_env_or_default();
+        let instance = Instance::new(wgpu::InstanceDescriptor {
+            // TODO: consider allowing users to pass display handle when constructing a RenderContext
+            display: None,
+            backends,
+            flags,
+            memory_budget_thresholds,
+            backend_options,
+        });
         Self {
             instance,
             devices: Vec::new(),
@@ -129,7 +135,7 @@ impl RenderContext {
         self.configure_surface(surface);
     }
 
-    fn configure_surface(&self, surface: &RenderSurface<'_>) {
+    pub fn configure_surface(&self, surface: &RenderSurface<'_>) {
         let device = &self.devices[surface.dev_id].device;
         surface.surface.configure(device, &surface.config);
     }

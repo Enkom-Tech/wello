@@ -3,9 +3,11 @@
 
 //! Paints for drawing shapes.
 
+use crate::TextureId;
 use crate::blurred_rounded_rect::BlurredRoundedRectangle;
 use crate::color::palette::css::BLACK;
 use crate::color::{ColorSpaceTag, HueDirection, Srgb, gradient};
+use crate::geometry::RectU16;
 use crate::kurbo::{Affine, Point, Vec2};
 use crate::math::{FloatExt, compute_erf7};
 use crate::paint::{Image, ImageSource, IndexedPaint, Paint, PremulColor, Tint};
@@ -17,7 +19,7 @@ use alloc::vec::Vec;
 #[cfg(not(feature = "multithreading"))]
 use core::cell::OnceCell;
 use core::hash::{Hash, Hasher};
-use fearless_simd::{Simd, SimdBase, SimdFloat, f32x4, f32x16, mask32x4, mask32x16};
+use fearless_simd::{Simd, SimdBase, SimdFloat, SimdFrom, f32x4, f32x16, mask32x16};
 use peniko::color::cache_key::{BitEq, BitHash, CacheKey};
 use peniko::color::gradient_unpremultiplied;
 use peniko::{
@@ -73,7 +75,7 @@ impl EncodeExt for Gradient {
             return paint;
         }
 
-        let mut may_have_opacities = self.stops.iter().any(|s| s.color.components[3] != 1.0);
+        let mut may_have_transparency = self.stops.iter().any(|s| s.color.components[3] != 1.0);
 
         let mut base_transform;
 
@@ -161,7 +163,7 @@ impl EncodeExt for Gradient {
                 // alpha-compositing in case the radial gradient is undefined in certain positions,
                 // in which case the resulting color will be transparent and thus the gradient overall
                 // must be treated as non-opaque.
-                may_have_opacities |= radial_kind.has_undefined();
+                may_have_transparency |= radial_kind.has_undefined();
 
                 EncodedKind::Radial(radial_kind)
             }
@@ -229,7 +231,7 @@ impl EncodeExt for Gradient {
             y_advance,
             ranges,
             extend: self.extend,
-            may_have_opacities,
+            may_have_transparency,
             u8_lut: OnceCell::new(),
             f32_lut: OnceCell::new(),
         };
@@ -518,7 +520,7 @@ impl EncodeExt for Image {
         let tint_has_opacity = tint.as_ref().is_some_and(|t| t.color.components[3] < 1.0);
 
         let encoded = EncodedImage {
-            may_have_opacities: self.image.may_have_opacities() || tint_has_opacity,
+            may_have_transparency: self.image.may_have_transparency() || tint_has_opacity,
             source: self.image.clone(),
             sampler,
             transform,
@@ -540,6 +542,8 @@ pub enum EncodedPaint {
     Gradient(EncodedGradient),
     /// An encoded image.
     Image(EncodedImage),
+    /// An encoded external texture.
+    ExternalTexture(EncodedExternalTexture),
     /// A blurred, rounded rectangle.
     BlurredRoundedRect(EncodedBlurredRoundedRectangle),
 }
@@ -564,7 +568,7 @@ pub struct EncodedImage {
     /// Sampler
     pub sampler: ImageSampler,
     /// Whether the image has opacities.
-    pub may_have_opacities: bool,
+    pub may_have_transparency: bool,
     /// A transform to apply to the image.
     pub transform: Affine,
     /// The advance in image coordinates for one step in the x direction.
@@ -572,6 +576,26 @@ pub struct EncodedImage {
     /// The advance in image coordinates for one step in the y direction.
     pub y_advance: Vec2,
     /// Optional tint applied to the image.
+    pub tint: Option<Tint>,
+}
+
+/// An encoded external texture.
+///
+/// The texture must be bound by the user at render-time in order for us to be able to sample from
+/// it; it is not interned into the renderer.
+#[derive(Debug)]
+pub struct EncodedExternalTexture {
+    /// External texture handle.
+    pub texture_id: TextureId,
+    /// Source region of the texture in texel coordinates.
+    pub source_region: RectU16,
+    /// Sampler parameters.
+    pub sampler: ImageSampler,
+    /// Whether the sampled content may contain non-opaque pixels.
+    pub may_have_transparency: bool,
+    /// Inverse destination transform, mapping scene coordinates to local source-rect space.
+    pub transform: Affine,
+    /// Optional tint applied to the sampled color.
     pub tint: Option<Tint>,
 }
 
@@ -747,19 +771,21 @@ pub struct EncodedGradient {
     /// The extend of the gradient.
     pub extend: Extend,
     /// Whether the gradient requires `source_over` compositing.
-    pub may_have_opacities: bool,
+    pub may_have_transparency: bool,
     u8_lut: OnceCell<GradientLut<u8>>,
     f32_lut: OnceCell<GradientLut<f32>>,
 }
 
 impl EncodedGradient {
     /// Get the lookup table for sampling u8-based gradient values.
+    // No need to vectorize here, as vectorization happens in the constructor.
     pub fn u8_lut<S: Simd>(&self, simd: S) -> &GradientLut<u8> {
         self.u8_lut
             .get_or_init(|| GradientLut::new(simd, &self.ranges))
     }
 
     /// Get the lookup table for sampling f32-based gradient values.
+    // No need to vectorize here, as vectorization happens in the constructor.
     pub fn f32_lut<S: Simd>(&self, simd: S) -> &GradientLut<f32> {
         self.f32_lut
             .get_or_init(|| GradientLut::new(simd, &self.ranges))
@@ -961,6 +987,7 @@ pub trait FromF32Color: Sized + Debug + Copy + Clone {
 impl FromF32Color for f32 {
     const ZERO: Self = 0.0;
 
+    #[inline(always)]
     fn from_f32<S: Simd>(color: f32x4<S>) -> [Self; 4] {
         color.into()
     }
@@ -969,6 +996,7 @@ impl FromF32Color for f32 {
 impl FromF32Color for u8 {
     const ZERO: Self = 0;
 
+    #[inline(always)]
     fn from_f32<S: Simd>(mut color: f32x4<S>) -> [Self; 4] {
         let simd = color.simd;
         color = color.mul_add(f32x4::splat(simd, 255.0), f32x4::splat(simd, 0.5));
@@ -992,6 +1020,14 @@ pub struct GradientLut<T: FromF32Color> {
 impl<T: FromF32Color> GradientLut<T> {
     /// Create a new lookup table.
     fn new<S: Simd>(simd: S, ranges: &[GradientRange]) -> Self {
+        simd.vectorize(
+            #[inline(always)]
+            || Self::new_inner(simd, ranges),
+        )
+    }
+
+    #[inline(always)]
+    fn new_inner<S: Simd>(simd: S, ranges: &[GradientRange]) -> Self {
         let lut_size = determine_lut_size(ranges);
         let mut lut = vec![[T::ZERO; 4]; lut_size];
 
@@ -1029,8 +1065,10 @@ impl<T: FromF32Color> GradientLut<T> {
                 // Premultiply colors, since we did interpolation in unpremultiplied space.
                 if range.interpolation_alpha_space == InterpolationAlphaSpace::Unpremultiplied {
                     result = {
-                        let mask =
-                            mask32x16::block_splat(mask32x4::from_slice(simd, &[-1, -1, -1, 0]));
+                        let mask = mask32x16::simd_from(
+                            simd,
+                            [-1, -1, -1, 0, -1, -1, -1, 0, -1, -1, -1, 0, -1, -1, -1, 0],
+                        );
                         simd.select_f32x16(mask, result * alphas, alphas)
                     };
                 }

@@ -1,7 +1,6 @@
 // Copyright 2025 the Vello Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-use crate::RenderMode;
 use crate::dispatch::Dispatcher;
 use crate::dispatch::multi_threaded::cost::{COST_THRESHOLD, estimate_render_task_cost};
 use crate::dispatch::multi_threaded::worker::Worker;
@@ -9,6 +8,7 @@ use crate::fine::{Fine, FineKernel};
 use crate::kurbo::{Affine, BezPath, PathEl, Point, Rect, Stroke};
 use crate::peniko::{BlendMode, Fill};
 use crate::region::Regions;
+use crate::{CompositeMode, RasterizerSettings};
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -26,11 +26,13 @@ use vello_common::coarse::{Cmd, MODE_CPU, Wide};
 use vello_common::encode::EncodedPaint;
 use vello_common::fearless_simd::{Level, Simd, dispatch};
 use vello_common::filter_effects::Filter;
+use vello_common::geometry::RectU16;
 use vello_common::mask::Mask;
 use vello_common::paint::{ImageResolver, Paint};
+use vello_common::pixmap::PixmapMut;
 use vello_common::render_graph::RenderGraph;
 use vello_common::strip::Strip;
-use vello_common::strip_generator::{StripGenerator, StripStorage};
+use vello_common::strip_generator::StripGenerator;
 
 mod cost;
 mod worker;
@@ -98,9 +100,8 @@ pub(crate) struct MultiThreadedDispatcher {
     task_idx: u32,
     /// The number of threads active in the thread pool.
     num_threads: u16,
-    /// The strip generator for the main thread, only used for recordings.
+    /// The strip generator for the main thread, used for clip path rasterization.
     strip_generator: StripGenerator,
-    strip_storage: StripStorage,
     level: Level,
     flushed: bool,
     // So that we can reuse memory allocations across different runs.
@@ -116,13 +117,11 @@ impl MultiThreadedDispatcher {
             .num_threads(num_threads as usize)
             .build()
             .unwrap();
-        // + 1 because the main thread also stores an alpha buffer, used for recordings.
-        let alpha_storage = MaybePresent::new(vec![vec![]; usize::from(num_threads + 1)]);
+        let alpha_storage = MaybePresent::new(vec![vec![]; usize::from(num_threads)]);
         let workers = Arc::new(ThreadLocal::new());
 
         {
-            // Start counting from 1, as thread_idx 0 is reserved for the main thread.
-            let thread_ids = Arc::new(AtomicU8::new(1));
+            let thread_ids = Arc::new(AtomicU8::new(0));
             let workers = workers.clone();
 
             // Create all workers once in `new`, so that later on we can just call`.get().unwrap()`.
@@ -151,7 +150,6 @@ impl MultiThreadedDispatcher {
             task_sender: None,
             coarse_task_receiver: None,
             strip_generator: StripGenerator::new(width, height, level),
-            strip_storage: StripStorage::default(),
             level,
             alpha_storage,
             num_threads,
@@ -166,27 +164,29 @@ impl MultiThreadedDispatcher {
     #[cfg(feature = "f32_pipeline")]
     fn rasterize_f32(
         &self,
-        buffer: &mut [u8],
-        width: u16,
-        height: u16,
+        target: PixmapMut<'_>,
+        scene_width: u16,
+        scene_height: u16,
+        settings: RasterizerSettings,
         encoded_paints: &[EncodedPaint],
         image_resolver: &dyn ImageResolver,
     ) {
         use crate::fine::F32Kernel;
-        dispatch!(self.level, simd => self.rasterize_with::<_, F32Kernel>(simd, buffer, width, height, encoded_paints, image_resolver));
+        dispatch!(self.level, simd => self.rasterize_with::<_, F32Kernel>(simd, target, scene_width, scene_height, settings, encoded_paints, image_resolver));
     }
 
     #[cfg(feature = "u8_pipeline")]
     fn rasterize_u8(
         &self,
-        buffer: &mut [u8],
-        width: u16,
-        height: u16,
+        target: PixmapMut<'_>,
+        scene_width: u16,
+        scene_height: u16,
+        settings: RasterizerSettings,
         encoded_paints: &[EncodedPaint],
         image_resolver: &dyn ImageResolver,
     ) {
         use crate::fine::U8Kernel;
-        dispatch!(self.level, simd => self.rasterize_with::<_, U8Kernel>(simd, buffer, width, height, encoded_paints, image_resolver));
+        dispatch!(self.level, simd => self.rasterize_with::<_, U8Kernel>(simd, target, scene_width, scene_height, settings, encoded_paints, image_resolver));
     }
 
     fn init(&mut self) {
@@ -316,20 +316,6 @@ impl MultiThreadedDispatcher {
                                 mask,
                                 encoded_paints,
                             ),
-                            CoarseTaskType::RenderWideCommand {
-                                strips,
-                                blend_mode,
-                                paint,
-                                thread_id,
-                                mask,
-                            } => self.wide.generate(
-                                &strips,
-                                paint.clone(),
-                                blend_mode,
-                                thread_id,
-                                mask,
-                                encoded_paints,
-                            ),
                             CoarseTaskType::PushLayer {
                                 thread_id,
                                 clip_path,
@@ -375,16 +361,26 @@ impl MultiThreadedDispatcher {
         }
     }
 
+    // No need to vectorize here, as vectorization happens in each of the
+    // functions that are called within.
     fn rasterize_with<S: Simd, F: FineKernel<S>>(
         &self,
         simd: S,
-        buffer: &mut [u8],
-        width: u16,
-        height: u16,
+        mut target: PixmapMut<'_>,
+        scene_width: u16,
+        scene_height: u16,
+        settings: RasterizerSettings,
         encoded_paints: &[EncodedPaint],
         image_resolver: &dyn ImageResolver,
     ) {
-        let mut buffer = Regions::new(width, height, buffer);
+        let target_width = target.width();
+        let target_height = target.height();
+        let mut buffer = Regions::new_at_offset(
+            (scene_width, scene_height),
+            settings.offset,
+            (target_width, target_height),
+            target.data_mut(),
+        );
         let fines = ThreadLocal::new();
         let wide = &self.wide;
         let alpha_slots = self.alpha_storage.take();
@@ -401,7 +397,12 @@ impl MultiThreadedDispatcher {
                 let wtile = wide.get(x, y);
                 fine.set_coords(x, y);
 
-                fine.clear(wtile.bg);
+                if settings.composite_mode == CompositeMode::Replace || wtile.bg.is_opaque() {
+                    fine.clear(wtile.bg);
+                } else {
+                    // See the comment in the single-threaded dispatcher.
+                    fine.unpack(region);
+                }
                 for cmd in &wtile.cmds {
                     let thread_idx = match cmd {
                         Cmd::AlphaFill(a) => Some(wide.attrs.fill[a.attrs_idx as usize].thread_idx),
@@ -559,7 +560,6 @@ impl Dispatcher for MultiThreadedDispatcher {
         self.task_sender = None;
         self.coarse_task_receiver = None;
         self.strip_generator.reset();
-        self.strip_storage.clear();
         self.alpha_storage.with_inner(|alphas| {
             for alpha in alphas {
                 alpha.clear();
@@ -595,22 +595,15 @@ impl Dispatcher for MultiThreadedDispatcher {
         drop(sender);
         self.run_coarse(false, encoded_paints);
 
-        self.alpha_storage.with_inner(|alphas| {
-            // The main thread stores the alphas that are produced by playing a recording.
-            // It is important we reserve the thread id 0 for this as the implementation for
-            // `Recordable` uses this thread ID when generating the commands for coarse rasterization.
-            alphas[0] = std::mem::take(&mut self.strip_storage.alphas);
-        });
-
         self.flushed = true;
     }
 
     fn rasterize(
         &self,
-        buffer: &mut [u8],
-        render_mode: RenderMode,
-        width: u16,
-        height: u16,
+        target: PixmapMut<'_>,
+        scene_width: u16,
+        scene_height: u16,
+        settings: RasterizerSettings,
         encoded_paints: &[EncodedPaint],
         image_resolver: &dyn ImageResolver,
     ) {
@@ -619,71 +612,52 @@ impl Dispatcher for MultiThreadedDispatcher {
         // Only u8 pipeline enabled
         #[cfg(all(feature = "u8_pipeline", not(feature = "f32_pipeline")))]
         {
-            let _ = render_mode;
-            self.rasterize_u8(buffer, width, height, encoded_paints, image_resolver);
+            self.rasterize_u8(
+                target,
+                scene_width,
+                scene_height,
+                settings,
+                encoded_paints,
+                image_resolver,
+            );
         }
         // Only f32 pipeline enabled
         #[cfg(all(feature = "f32_pipeline", not(feature = "u8_pipeline")))]
         {
-            let _ = render_mode;
-            self.rasterize_f32(buffer, width, height, encoded_paints, image_resolver);
+            self.rasterize_f32(
+                target,
+                scene_width,
+                scene_height,
+                settings,
+                encoded_paints,
+                image_resolver,
+            );
         }
 
         // Both pipelines enabled
         #[cfg(all(feature = "f32_pipeline", feature = "u8_pipeline"))]
-        match render_mode {
-            RenderMode::OptimizeSpeed => {
-                self.rasterize_u8(buffer, width, height, encoded_paints, image_resolver);
+        match settings.render_mode {
+            crate::RenderMode::OptimizeSpeed => {
+                self.rasterize_u8(
+                    target,
+                    scene_width,
+                    scene_height,
+                    settings,
+                    encoded_paints,
+                    image_resolver,
+                );
             }
-            RenderMode::OptimizeQuality => {
-                self.rasterize_f32(buffer, width, height, encoded_paints, image_resolver);
+            crate::RenderMode::OptimizeQuality => {
+                self.rasterize_f32(
+                    target,
+                    scene_width,
+                    scene_height,
+                    settings,
+                    encoded_paints,
+                    image_resolver,
+                );
             }
         }
-    }
-
-    fn composite_at_offset(
-        &self,
-        _buffer: &mut [u8],
-        _width: u16,
-        _height: u16,
-        _dst_x: u16,
-        _dst_y: u16,
-        _dst_buffer_width: u16,
-        _dst_buffer_height: u16,
-        _render_mode: RenderMode,
-        _encoded_paints: &[EncodedPaint],
-        _image_resolver: &dyn ImageResolver,
-    ) {
-        // TODO: Implement composite_at_offset for multi-threaded dispatcher.
-        unimplemented!("composite_at_offset is not implemented for multi-threaded dispatcher");
-    }
-
-    fn generate_wide_cmd(
-        &mut self,
-        strip_buf: &[Strip],
-        paint: Paint,
-        blend_mode: BlendMode,
-        _encoded_paints: &[EncodedPaint],
-    ) {
-        // Note that we are essentially round-tripping here: The wide container is inside of the
-        // main thread, but we first send a render task to a child thread which basically just
-        // forwards it back to the main thread again. We cannot apply the wide command directly
-        // here because there might be other paths that are currently being processed in a child
-        // thread that should be rendered _before_ this wide command. Therefore, we treat it like
-        // any other render task so that we can utilize the same mechanism of assigning a task ID
-        // to ensure that they are executed in order.
-        self.register_task(RenderTaskType::WideCommand {
-            strip_buf: strip_buf.into(),
-            // Recordings are currently always built on the main thread and thus have a `thread_idx`
-            // of 0.
-            thread_idx: 0,
-            paint,
-            blend_mode,
-        });
-    }
-
-    fn strip_storage_mut(&mut self) -> &mut StripStorage {
-        &mut self.strip_storage
     }
 
     fn push_clip_path(
@@ -707,6 +681,10 @@ impl Dispatcher for MultiThreadedDispatcher {
         self.flush_tasks();
         self.clip_context.pop_clip();
     }
+
+    fn is_multi_threaded(&self) -> bool {
+        true
+    }
 }
 
 impl Debug for MultiThreadedDispatcher {
@@ -720,10 +698,10 @@ pub(crate) struct OwnedClip {
     strips: Box<[Strip]>,
     alphas: Box<[u8]>,
 
-    /// A coarse bounding box of the clip path in pixel coordinates `[left, top, right, bottom]`.
+    /// A coarse bounding box of the clip path in pixel coordinates.
     ///
     /// These bounds have already been intersected with the viewport.
-    bbox: [u16; 4],
+    bbox: RectU16,
 }
 
 /// A structure that allows storing and fetching existing allocations.
@@ -830,12 +808,6 @@ pub(crate) enum RenderTaskType {
         aliasing_threshold: Option<u8>,
         mask: Option<Mask>,
     },
-    WideCommand {
-        strip_buf: Box<[Strip]>,
-        thread_idx: u8,
-        paint: Paint,
-        blend_mode: BlendMode,
-    },
     StrokePath {
         path_range: Range<u32>,
         transform: Affine,
@@ -867,13 +839,6 @@ pub(crate) enum CoarseTaskType {
         strips: Range<u32>,
         blend_mode: BlendMode,
         paint: Paint,
-        mask: Option<Mask>,
-    },
-    RenderWideCommand {
-        thread_id: u8,
-        strips: Box<[Strip]>,
-        paint: Paint,
-        blend_mode: BlendMode,
         mask: Option<Mask>,
     },
     PushLayer {

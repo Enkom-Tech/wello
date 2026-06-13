@@ -3,29 +3,33 @@
 
 //! Basic render operations.
 
+#[cfg(feature = "text")]
+use crate::Resources;
+use crate::sampling::SampleRect;
+#[cfg(feature = "text")]
+use crate::text::GlyphRunBuilder;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::ops::Range;
+use vello_common::TextureId;
+use vello_common::blurred_rounded_rect::BlurredRoundedRectangle;
 use vello_common::clip::ClipContext;
 use vello_common::coarse::{MODE_HYBRID, Wide, WideTilesBbox};
-use vello_common::encode::{EncodeExt, EncodedPaint};
+use vello_common::encode::{EncodeExt, EncodedExternalTexture, EncodedPaint};
 use vello_common::fearless_simd::Level;
 use vello_common::filter_effects::Filter;
-#[cfg(feature = "text")]
-use vello_common::glyph::{GlyphCaches, GlyphRenderer, GlyphRunBuilder, GlyphType, PreparedGlyph};
+use vello_common::geometry::RectU16;
 use vello_common::kurbo::{Affine, BezPath, Rect, Shape, Stroke};
 use vello_common::mask::Mask;
 use vello_common::multi_atlas::AtlasConfig;
 use vello_common::paint::{Paint, PaintType, Tint};
 #[cfg(feature = "text")]
 use vello_common::peniko::FontData;
-use vello_common::peniko::{BlendMode, Compose, Fill, Mix};
-use vello_common::recording::{
-    PushLayerCommand, Recordable, Recorder, Recording, RenderCommand, RenderState,
-};
+use vello_common::peniko::color::palette::css::BLACK;
+use vello_common::peniko::{BlendMode, Compose, Extend, Fill, ImageQuality, ImageSampler, Mix};
 use vello_common::render_graph::{RenderGraph, RenderNodeKind};
-use vello_common::strip::Strip;
+use vello_common::render_state::RenderState;
 use vello_common::strip_generator::{GenerationMode, StripGenerator, StripStorage};
 use vello_common::util::is_axis_aligned;
 
@@ -131,11 +135,13 @@ impl SceneConstraints {
     }
 
     /// Caller guarantees that the scene will only use the default (normal, source-over)
-    /// blend mode.
+    /// blend mode in the root layer. In case you still want to use blending, you need to
+    /// make sure that you have pushed at least one "wrapper" layer, such that the destination
+    /// of the blending operation is never the root layer.
     ///
     /// # Panics
     ///
-    /// The renderer will panic if a non-default blend mode is used.
+    /// The renderer will panic if a non-default blend mode is used in the root layer.
     #[inline(always)]
     pub fn default_blending_only(self) -> Self {
         Self(self.0 | Self::DEFAULT_BLENDING_ONLY)
@@ -147,8 +153,8 @@ impl SceneConstraints {
     }
 
     #[inline(always)]
-    fn assert_blend_mode(&self, blend_mode: BlendMode) {
-        if self.use_default_blending_only() {
+    fn assert_blend_mode(&self, blend_mode: BlendMode, nested_layer: bool) {
+        if self.use_default_blending_only() && !nested_layer {
             assert!(
                 blend_mode == DEFAULT_BLEND_MODE,
                 "scene constrained to default blending"
@@ -208,7 +214,7 @@ pub struct Scene {
     // The reason we use `RefCell` here is that during `render`, we need
     // mutable access so we can store additional encoded paints for filtered layers,
     // if applicable.
-    /// Storage for encoded gradient and image paint data.
+    /// Storage for encoded non-solid paint data.
     pub(crate) encoded_paints: RefCell<Vec<EncodedPaint>>,
     /// Whether the current paint is visible (e.g., alpha > 0).
     paint_visible: bool,
@@ -216,9 +222,6 @@ pub struct Scene {
     pub(crate) strip_generator: StripGenerator,
     /// Storage for generated strips and alpha values.
     pub(crate) strip_storage: RefCell<StripStorage>,
-    /// Cache for rasterized glyphs to improve text rendering performance.
-    #[cfg(feature = "text")]
-    pub(crate) glyph_caches: Option<GlyphCaches>,
     /// Counter for generating unique layer IDs.
     layer_id_next: u32,
     /// Dependency graph for managing layer rendering order and filter effects.
@@ -294,7 +297,7 @@ impl Scene {
 
         // Create root node (layer_id 0) as the first node (will be node 0).
         // This ensures the root layer is always rendered last in the execution order.
-        let wtile_bbox = WideTilesBbox::new([0, 0, wide.width_tiles(), wide.height_tiles()]);
+        let wtile_bbox = WideTilesBbox::new(0, 0, wide.width_tiles(), wide.height_tiles());
         let _ = render_graph.add_node(RenderNodeKind::RootLayer {
             layer_id: 0,
             wtile_bbox,
@@ -313,8 +316,6 @@ impl Scene {
             strip_generator: StripGenerator::new(width, height, settings.level),
             // Start strip storage in `Append` mode since we enable the fast path by default.
             strip_storage: RefCell::new(StripStorage::new(GenerationMode::Append)),
-            #[cfg(feature = "text")]
-            glyph_caches: Some(GlyphCaches::default()),
             layer_id_next: 0,
             render_graph,
             filter: None,
@@ -348,6 +349,36 @@ impl Scene {
                 self.render_state.tint,
             ),
         }
+    }
+
+    /// Encode the current external texture into a [`Paint`] that can be used for rendering.
+    fn encode_external_texture_paint(
+        &mut self,
+        texture_id: TextureId,
+        source_region: RectU16,
+        quality: ImageQuality,
+        x_extend: Extend,
+        y_extend: Extend,
+        transform: Affine,
+    ) -> Paint {
+        let idx = self.encoded_paints.borrow().len();
+        let encoded = EncodedExternalTexture {
+            texture_id,
+            source_region,
+            sampler: ImageSampler {
+                x_extend,
+                y_extend,
+                quality,
+                alpha: 1.0,
+            },
+            may_have_transparency: true,
+            transform: transform.inverse(),
+            tint: self.render_state.tint,
+        };
+        self.encoded_paints
+            .borrow_mut()
+            .push(EncodedPaint::ExternalTexture(encoded));
+        Paint::Indexed(vello_common::paint::IndexedPaint::new(idx))
     }
 
     /// Fill a path with the current paint and fill rule.
@@ -487,24 +518,195 @@ impl Scene {
             return;
         }
 
-        // TODO: Use a temporary storage for rect paths, like in `vello_cpu`.
-        self.fill_path(&rect.to_path(DEFAULT_TOLERANCE));
+        if is_axis_aligned(&self.render_state.transform) && self.aliasing_threshold.is_none() {
+            self.with_optional_filter(|ctx| {
+                let paint = ctx.encode_current_paint();
+                let transformed_rect = ctx.render_state.transform.transform_rect_bbox(*rect);
+                let strip_storage = &mut ctx.strip_storage.borrow_mut();
+                let strip_start = strip_storage.strips.len();
+                ctx.strip_generator.generate_filled_rect_fast(
+                    &transformed_rect,
+                    strip_storage,
+                    ctx.clip_context.get(),
+                );
+
+                submit_strips!(ctx, strip_storage, strip_start, paint);
+            });
+        } else {
+            // TODO: Use a temporary storage for rect paths, like in `vello_cpu`.
+            self.fill_path(&rect.to_path(DEFAULT_TOLERANCE));
+        }
+    }
+
+    fn try_fast_rect(&mut self, rect: &Rect) -> bool {
+        let Some(bounds) = self.fast_rect_bounds(rect) else {
+            return false;
+        };
+
+        let paint = self.encode_current_paint();
+        self.push_fast_rect(bounds, paint);
+        true
+    }
+
+    /// Sample rectangular regions from an externally bound texture and draw them with the
+    /// corresponding transforms.
+    ///
+    /// The per-rect transforms are composed with the current
+    /// [scene transform][`Self::set_transform`]. This transform is relative to the local region
+    /// defined by each [`SampleRect`]: i.e., the origin of each [`SampleRect`] is used only to
+    /// determine the region to sample in the source [`TextureId`], and is ignored for determining
+    /// the destination. Note that the [`paint transform`](Self::set_paint_transform) has no impact
+    /// on this method.
+    ///
+    /// A texture with the given [`TextureId`] must be supplied at render time. The given
+    /// [source regions][`SampleRect::source_region`] must be within bounds of that texture. The
+    /// texture is treated as premultiplied alpha in the render target's color space. See the
+    /// backend's binding type for more information on texture requirements.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "f64→f32 truncation is acceptable for pixel coordinates"
+    )]
+    pub fn draw_texture_rects(
+        &mut self,
+        texture_id: TextureId,
+        quality: ImageQuality,
+        rects: impl IntoIterator<Item = SampleRect>,
+    ) {
+        // This API currently doesn't take extend mode parameters: as of writing, the
+        // `render_strips.wgsl` shader does not use extend modes to sample across boundaries, i.e.,
+        // sampling near a boundary doesn't take extend modes into account when determining where
+        // the sample should be taken.
+        //
+        // Because in this API the destination drawn is always the transformed input rect, this
+        // means extend modes don't currently materially impact rendering. In general drawing with
+        // an external texture brush, extend modes would matter, so we still encode them.
+        let x_extend = Extend::Pad;
+        let y_extend = Extend::Pad;
+
+        if self.can_emit_fast_strips() {
+            for rect in rects {
+                if rect.source_region.is_empty() {
+                    continue;
+                }
+
+                let w = f64::from(rect.source_region.width());
+                let h = f64::from(rect.source_region.height());
+                let transform = self.render_state.transform * rect.transform;
+
+                if !is_axis_aligned(&transform) {
+                    // Non-axis-aligned rects fall back to the strip path (still
+                    // in the fast buffer since we checked the global conditions).
+                    let paint = self.encode_external_texture_paint(
+                        texture_id,
+                        rect.source_region,
+                        quality,
+                        x_extend,
+                        y_extend,
+                        transform,
+                    );
+                    let dst_rect = Rect::new(0., 0., w, h);
+                    self.fill_path_with(
+                        &dst_rect.to_path(DEFAULT_TOLERANCE),
+                        transform,
+                        self.render_state.fill_rule,
+                        paint,
+                        self.aliasing_threshold,
+                    );
+                    continue;
+                }
+
+                let dst_rect = Rect::new(0., 0., w, h);
+                let transformed_rect = transform.transform_rect_bbox(dst_rect);
+
+                let x0 = transformed_rect.x0.max(0.).min(f64::from(self.width));
+                let y0 = transformed_rect.y0.max(0.).min(f64::from(self.height));
+                let x1 = transformed_rect.x1.max(0.).min(f64::from(self.width));
+                let y1 = transformed_rect.y1.max(0.).min(f64::from(self.height));
+
+                // Skip mirrored or zero-sized rectangles.
+                if x1 <= x0 || y1 <= y0 {
+                    continue;
+                }
+
+                let paint = self.encode_external_texture_paint(
+                    texture_id,
+                    rect.source_region,
+                    quality,
+                    x_extend,
+                    y_extend,
+                    transform,
+                );
+
+                self.fast_strips_buffer
+                    .commands
+                    .push(FastStripCommand::Rect(FastPathRect {
+                        x0: x0 as f32,
+                        y0: y0 as f32,
+                        x1: x1 as f32,
+                        y1: y1 as f32,
+                        paint,
+                    }));
+            }
+        } else {
+            self.with_optional_filter(|ctx| {
+                for rect in rects {
+                    if rect.source_region.is_empty() {
+                        continue;
+                    }
+
+                    let w = f64::from(rect.source_region.width());
+                    let h = f64::from(rect.source_region.height());
+                    let transform = ctx.render_state.transform * rect.transform;
+                    let paint = ctx.encode_external_texture_paint(
+                        texture_id,
+                        rect.source_region,
+                        quality,
+                        x_extend,
+                        y_extend,
+                        transform,
+                    );
+                    let dst_rect = Rect::new(0., 0., w, h);
+                    ctx.fill_path_with(
+                        &dst_rect.to_path(DEFAULT_TOLERANCE),
+                        transform,
+                        ctx.render_state.fill_rule,
+                        paint,
+                        ctx.aliasing_threshold,
+                    );
+                }
+            });
+        }
+    }
+
+    /// Whether we're in a state that allows pushing commands directly into
+    /// [`Self::fast_strips_buffer`], bypassing coarse rasterization.
+    #[inline]
+    fn can_emit_fast_strips(&self) -> bool {
+        self.strip_path_mode != StripPathMode::CoarseOnly
+            && !self.wide.has_layers()
+            && self.filter.is_none()
+            && self.clip_context.get().is_none()
     }
 
     #[expect(
         clippy::cast_possible_truncation,
         reason = "f64→f32 truncation is acceptable for pixel coordinates"
     )]
-    fn try_fast_rect(&mut self, rect: &Rect) -> bool {
-        if self.strip_path_mode == StripPathMode::CoarseOnly
-            || self.wide.has_layers()
-            || self.filter.is_some()
-        {
-            return false;
-        }
+    fn push_fast_rect(&mut self, bounds: Rect, paint: Paint) {
+        self.fast_strips_buffer
+            .commands
+            .push(FastStripCommand::Rect(FastPathRect {
+                x0: bounds.x0 as f32,
+                y0: bounds.y0 as f32,
+                x1: bounds.x1 as f32,
+                y1: bounds.y1 as f32,
+                paint,
+            }));
+    }
 
-        if self.clip_context.get().is_some() {
-            return false;
+    fn fast_rect_bounds(&self, rect: &Rect) -> Option<Rect> {
+        if !self.can_emit_fast_strips() {
+            return None;
         }
 
         // TODO: Either bail out or properly implement the case where `aliasing_threshold` is set.
@@ -513,7 +715,7 @@ impl Scene {
         // We can't handle skewed rectangles.
         // TODO: Maybe support rotated rectangles (https://github.com/linebender/vello/pull/1482#discussion_r2881223621)
         if !is_axis_aligned(&self.render_state.transform) {
-            return false;
+            return None;
         }
 
         let transformed_rect = self.render_state.transform.transform_rect_bbox(*rect);
@@ -525,22 +727,10 @@ impl Scene {
 
         // Can't handle mirrored or zero-sized rectangles.
         if x1 <= x0 || y1 <= y0 {
-            return false;
+            return None;
         }
 
-        let paint = self.encode_current_paint();
-
-        self.fast_strips_buffer
-            .commands
-            .push(FastStripCommand::Rect(FastPathRect {
-                x0: x0 as f32,
-                y0: y0 as f32,
-                x1: x1 as f32,
-                y1: y1 as f32,
-                paint,
-            }));
-
-        true
+        Some(Rect::new(x0, y0, x1, y1))
     }
 
     /// Stroke a rectangle with the current paint and stroke settings.
@@ -548,10 +738,82 @@ impl Scene {
         self.stroke_path(&rect.to_path(DEFAULT_TOLERANCE));
     }
 
+    /// Fill a blurred rectangle with the given corner radius and standard deviation.
+    ///
+    /// This operation uses the current transform and paint transform. Like Vello CPU, it only
+    /// uses solid paints; non-solid paints fall back to black.
+    pub fn fill_blurred_rounded_rect(&mut self, rect: &Rect, radius: f32, std_dev: f32) {
+        if !self.paint_visible {
+            return;
+        }
+
+        self.with_optional_filter(|ctx| {
+            let rect = rect.abs();
+            let color = match ctx.render_state.paint {
+                PaintType::Solid(s) => s,
+                _ => BLACK,
+            };
+            let blurred_rect = BlurredRoundedRectangle {
+                rect,
+                color,
+                radius,
+                std_dev,
+            };
+
+            let kernel_size = 2.5 * std_dev;
+            let inflated_rect = rect.inflate(f64::from(kernel_size), f64::from(kernel_size));
+            let transform = ctx.render_state.transform * ctx.render_state.paint_transform;
+            let paint =
+                blurred_rect.encode_into(&mut ctx.encoded_paints.borrow_mut(), transform, None);
+
+            if let Some(bounds) = ctx.fast_rect_bounds(&inflated_rect) {
+                ctx.push_fast_rect(bounds, paint);
+                return;
+            }
+
+            if is_axis_aligned(&ctx.render_state.transform) && ctx.aliasing_threshold.is_none() {
+                let transformed_rect = ctx
+                    .render_state
+                    .transform
+                    .transform_rect_bbox(inflated_rect);
+                let strip_storage = &mut ctx.strip_storage.borrow_mut();
+                let strip_start = strip_storage.strips.len();
+                ctx.strip_generator.generate_filled_rect_fast(
+                    &transformed_rect,
+                    strip_storage,
+                    ctx.clip_context.get(),
+                );
+
+                submit_strips!(ctx, strip_storage, strip_start, paint);
+            } else {
+                ctx.fill_path_with(
+                    &inflated_rect.to_path(DEFAULT_TOLERANCE),
+                    ctx.render_state.transform,
+                    Fill::NonZero,
+                    paint,
+                    ctx.aliasing_threshold,
+                );
+            }
+        });
+    }
+
     /// Creates a builder for drawing a run of glyphs that have the same attributes.
     #[cfg(feature = "text")]
-    pub fn glyph_run(&mut self, font: &FontData) -> GlyphRunBuilder<'_, Self> {
-        GlyphRunBuilder::new(font.clone(), self.render_state.transform, self)
+    pub fn glyph_run<'a>(
+        &'a mut self,
+        resources: &'a mut Resources,
+        font: &FontData,
+    ) -> GlyphRunBuilder<'a> {
+        glifo::GlyphRunBuilder::new(
+            font.clone(),
+            self.render_state.transform,
+            self.render_state.paint_transform,
+            crate::text::HybridGlyphRunBackend {
+                scene: self,
+                resources,
+                atlas_cache_enabled: false,
+            },
+        )
     }
 
     /// Flush the fast path buffer through the normal coarse rasterization pipeline.
@@ -614,7 +876,8 @@ impl Scene {
         filter: Option<Filter>,
     ) {
         let blend_mode_val = blend_mode.unwrap_or(DEFAULT_BLEND_MODE);
-        self.constraints.assert_blend_mode(blend_mode_val);
+        self.constraints
+            .assert_blend_mode(blend_mode_val, self.wide.has_layers());
 
         self.layer_id_next += 1;
 
@@ -716,13 +979,25 @@ impl Scene {
 
     /// Set the blend mode for subsequent rendering operations.
     pub fn set_blend_mode(&mut self, blend_mode: BlendMode) {
-        self.constraints.assert_blend_mode(blend_mode);
+        self.constraints
+            .assert_blend_mode(blend_mode, self.wide.has_layers());
         self.render_state.blend_mode = blend_mode;
     }
 
     /// Set the stroke settings for subsequent stroke operations.
     pub fn set_stroke(&mut self, stroke: Stroke) {
         self.render_state.stroke = stroke;
+    }
+
+    /// Get the current stroke.
+    pub fn stroke(&self) -> &Stroke {
+        &self.render_state.stroke
+    }
+
+    /// Get a mutable reference to the current stroke.
+    #[cfg(feature = "text")]
+    pub(crate) fn stroke_mut(&mut self) -> &mut Stroke {
+        &mut self.render_state.stroke
     }
 
     /// Set the paint for subsequent rendering operations.
@@ -822,8 +1097,6 @@ impl Scene {
 
         self.render_state.reset();
 
-        #[cfg(feature = "text")]
-        self.glyph_caches.as_mut().unwrap().maintain();
         self.fast_strips_buffer.clear();
         self.strip_path_mode = StripPathMode::FastOnly;
         self.coarse_batch_splits.clear();
@@ -831,7 +1104,7 @@ impl Scene {
         self.layer_id_next = 0;
         self.render_graph.clear();
         let wtile_bbox =
-            WideTilesBbox::new([0, 0, self.wide.width_tiles(), self.wide.height_tiles()]);
+            WideTilesBbox::new(0, 0, self.wide.width_tiles(), self.wide.height_tiles());
         self.render_graph.add_node(RenderNodeKind::RootLayer {
             layer_id: 0,
             wtile_bbox,
@@ -869,352 +1142,20 @@ impl Scene {
     }
 }
 
-#[cfg(feature = "text")]
-impl GlyphRenderer for Scene {
-    fn fill_glyph(&mut self, prepared_glyph: PreparedGlyph<'_>) {
-        match prepared_glyph.glyph_type {
-            GlyphType::Outline(glyph) => {
-                let paint = self.encode_current_paint();
-                self.fill_path_with(
-                    glyph.path,
-                    prepared_glyph.transform,
-                    Fill::NonZero,
-                    paint,
-                    self.aliasing_threshold,
-                );
-            }
-            GlyphType::Bitmap(_) => {}
-            GlyphType::Colr(_) => {}
-        }
-    }
-
-    fn stroke_glyph(&mut self, prepared_glyph: PreparedGlyph<'_>) {
-        match prepared_glyph.glyph_type {
-            GlyphType::Outline(glyph) => {
-                let paint = self.encode_current_paint();
-                self.stroke_path_with(
-                    glyph.path,
-                    prepared_glyph.transform,
-                    paint,
-                    self.aliasing_threshold,
-                );
-            }
-            GlyphType::Bitmap(_) => {}
-            GlyphType::Colr(_) => {}
-        }
-    }
-
-    fn take_glyph_caches(&mut self) -> GlyphCaches {
-        self.glyph_caches.take().unwrap_or_default()
-    }
-
-    fn restore_glyph_caches(&mut self, cache: GlyphCaches) {
-        self.glyph_caches = Some(cache);
-    }
-}
-
-impl Recordable for Scene {
-    fn record<F>(&mut self, recording: &mut Recording, f: F)
-    where
-        F: FnOnce(&mut Recorder<'_>),
-    {
-        let mut recorder = Recorder::new(
-            recording,
-            self.render_state.transform,
-            #[cfg(feature = "text")]
-            self.take_glyph_caches(),
-        );
-        f(&mut recorder);
-        #[cfg(feature = "text")]
-        {
-            self.glyph_caches = Some(recorder.take_glyph_caches());
-        }
-    }
-
-    fn prepare_recording(&mut self, recording: &mut Recording) {
-        let buffers = recording.take_cached_strips();
-        let (strip_storage, strip_start_indices) =
-            self.generate_strips_from_commands(recording.commands(), buffers);
-        recording.set_cached_strips(strip_storage, strip_start_indices);
-    }
-
-    fn execute_recording(&mut self, recording: &Recording) {
-        let (cached_strips, cached_alphas) = recording.get_cached_strips();
-        let adjusted_strips = self.prepare_cached_strips(cached_strips, cached_alphas);
-
-        // Use pre-calculated strip start indices from when we generated the cache
-        let strip_start_indices = recording.get_strip_start_indices();
-        let mut range_index = 0;
-
-        // Replay commands in order, using cached strips for geometry
-        for command in recording.commands() {
-            match command {
-                RenderCommand::FillPath(_)
-                | RenderCommand::StrokePath(_)
-                | RenderCommand::FillRect(_)
-                | RenderCommand::StrokeRect(_) => {
-                    self.process_geometry_command(
-                        strip_start_indices,
-                        range_index,
-                        &adjusted_strips,
-                    );
-                    range_index += 1;
-                }
-                #[cfg(feature = "text")]
-                RenderCommand::FillOutlineGlyph(_) | RenderCommand::StrokeOutlineGlyph(_) => {
-                    self.process_geometry_command(
-                        strip_start_indices,
-                        range_index,
-                        &adjusted_strips,
-                    );
-                    range_index += 1;
-                }
-                RenderCommand::SetPaint(paint) => {
-                    self.set_paint(paint.clone());
-                }
-                RenderCommand::SetPaintTransform(transform) => {
-                    self.set_paint_transform(*transform);
-                }
-                RenderCommand::ResetPaintTransform => {
-                    self.reset_paint_transform();
-                }
-                RenderCommand::SetTransform(transform) => {
-                    self.set_transform(*transform);
-                }
-                RenderCommand::SetFillRule(fill_rule) => {
-                    self.set_fill_rule(*fill_rule);
-                }
-                RenderCommand::SetStroke(stroke) => {
-                    self.set_stroke(stroke.clone());
-                }
-                RenderCommand::SetTint(tint) => {
-                    self.set_tint(*tint);
-                }
-                RenderCommand::SetFilterEffect(filter) => {
-                    self.set_filter_effect(filter.clone());
-                }
-                RenderCommand::ResetFilterEffect => {
-                    self.reset_filter_effect();
-                }
-                RenderCommand::PushLayer(PushLayerCommand {
-                    clip_path,
-                    blend_mode,
-                    opacity,
-                    mask,
-                    filter,
-                }) => {
-                    self.push_layer(
-                        clip_path.as_ref(),
-                        *blend_mode,
-                        *opacity,
-                        mask.clone(),
-                        filter.clone(),
-                    );
-                }
-                RenderCommand::PopLayer => {
-                    self.pop_layer();
-                }
-            }
-        }
-    }
-}
-
-/// Recording management implementation.
-impl Scene {
-    /// Generate strips from strip commands and capture ranges.
-    ///
-    /// Returns:
-    /// - `collected_strips`: The generated strips.
-    /// - `collected_alphas`: The generated alphas.
-    /// - `strip_start_indices`: The start indices of strips for each geometry command.
-    fn generate_strips_from_commands(
-        &mut self,
-        commands: &[RenderCommand],
-        buffers: (StripStorage, Vec<usize>),
-    ) -> (StripStorage, Vec<usize>) {
-        let (mut strip_storage, mut strip_start_indices) = buffers;
-        strip_storage.clear();
-        strip_storage.set_generation_mode(GenerationMode::Append);
-        strip_start_indices.clear();
-
-        let saved_state = self.take_current_state();
-
-        for command in commands {
-            let start_index = strip_storage.strips.len();
-
-            match command {
-                RenderCommand::FillPath(path) => {
-                    self.strip_generator.generate_filled_path(
-                        path,
-                        self.render_state.fill_rule,
-                        self.render_state.transform,
-                        self.aliasing_threshold,
-                        &mut strip_storage,
-                        None,
-                    );
-                    strip_start_indices.push(start_index);
-                }
-                RenderCommand::StrokePath(path) => {
-                    self.strip_generator.generate_stroked_path(
-                        path,
-                        &self.render_state.stroke,
-                        self.render_state.transform,
-                        self.aliasing_threshold,
-                        &mut strip_storage,
-                        None,
-                    );
-                    strip_start_indices.push(start_index);
-                }
-                RenderCommand::FillRect(rect) => {
-                    self.strip_generator.generate_filled_path(
-                        rect.to_path(DEFAULT_TOLERANCE),
-                        self.render_state.fill_rule,
-                        self.render_state.transform,
-                        self.aliasing_threshold,
-                        &mut strip_storage,
-                        None,
-                    );
-                    strip_start_indices.push(start_index);
-                }
-                RenderCommand::StrokeRect(rect) => {
-                    self.strip_generator.generate_stroked_path(
-                        rect.to_path(DEFAULT_TOLERANCE),
-                        &self.render_state.stroke,
-                        self.render_state.transform,
-                        self.aliasing_threshold,
-                        &mut strip_storage,
-                        None,
-                    );
-                    strip_start_indices.push(start_index);
-                }
-                #[cfg(feature = "text")]
-                RenderCommand::FillOutlineGlyph((path, glyph_transform)) => {
-                    self.strip_generator.generate_filled_path(
-                        path,
-                        self.render_state.fill_rule,
-                        *glyph_transform,
-                        self.aliasing_threshold,
-                        &mut strip_storage,
-                        None,
-                    );
-                    strip_start_indices.push(start_index);
-                }
-                #[cfg(feature = "text")]
-                RenderCommand::StrokeOutlineGlyph((path, glyph_transform)) => {
-                    self.strip_generator.generate_stroked_path(
-                        path,
-                        &self.render_state.stroke,
-                        *glyph_transform,
-                        self.aliasing_threshold,
-                        &mut strip_storage,
-                        None,
-                    );
-                    strip_start_indices.push(start_index);
-                }
-                RenderCommand::SetTransform(transform) => {
-                    self.render_state.transform = *transform;
-                }
-                RenderCommand::SetFillRule(fill_rule) => {
-                    self.render_state.fill_rule = *fill_rule;
-                }
-                RenderCommand::SetStroke(stroke) => {
-                    self.render_state.stroke = stroke.clone();
-                }
-
-                _ => {}
-            }
-        }
-
-        self.restore_state(saved_state);
-
-        (strip_storage, strip_start_indices)
-    }
-
-    fn process_geometry_command(
-        &mut self,
-        strip_start_indices: &[usize],
-        range_index: usize,
-        adjusted_strips: &[Strip],
-    ) {
-        assert!(
-            range_index < strip_start_indices.len(),
-            "Strip range index out of bounds: range_index={}, strip_start_indices.len()={}",
-            range_index,
-            strip_start_indices.len()
-        );
-        let start = strip_start_indices[range_index];
-        let end = strip_start_indices
-            .get(range_index + 1)
-            .copied()
-            .unwrap_or(adjusted_strips.len());
-        let count = end - start;
-        if count == 0 {
-            // There are no strips to generate.
-            return;
-        }
-        assert!(
-            start < adjusted_strips.len() && count > 0,
-            "Invalid strip range: start={start}, end={end}, count={count}"
-        );
-        let paint = self.encode_current_paint();
-
-        if self.strip_path_mode != StripPathMode::CoarseOnly {
-            let mut strip_storage = self.strip_storage.borrow_mut();
-            let strip_start = strip_storage.strips.len();
-            strip_storage
-                .strips
-                .extend_from_slice(&adjusted_strips[start..end]);
-            self.fast_strips_buffer
-                .commands
-                .push(FastStripCommand::Path(FastStripsPath {
-                    strips: strip_start..strip_storage.strips.len(),
-                    paint,
-                }));
-        } else {
-            self.wide.generate(
-                &adjusted_strips[start..end],
-                paint,
-                self.render_state.blend_mode,
-                0,
-                None,
-                &self.encoded_paints.borrow(),
-            );
-        }
-    }
-
-    /// Prepare cached strips for rendering by adjusting alpha indices and extending alpha buffer.
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "Alphas length conversion is safe in this case"
-    )]
-    fn prepare_cached_strips(
-        &mut self,
-        cached_strips: &[Strip],
-        cached_alphas: &[u8],
-    ) -> Vec<Strip> {
-        let mut strip_storage = self.strip_storage.borrow_mut();
-        // Calculate offset for alpha indices based on current buffer size.
-        let alpha_offset = strip_storage.alphas.len() as u32;
-        // Extend current alpha buffer with cached alphas.
-        strip_storage.alphas.extend(cached_alphas);
-        // Create adjusted strips with corrected alpha indices
-        cached_strips
-            .iter()
-            .map(move |strip| {
-                let mut adjusted_strip = *strip;
-                adjusted_strip.set_alpha_idx(adjusted_strip.alpha_idx() + alpha_offset);
-                adjusted_strip
-            })
-            .collect()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "text")]
+    use crate::resources::Resources;
+    #[cfg(feature = "text")]
+    use alloc::sync::Arc;
     use core::f64::consts::PI;
+    #[cfg(feature = "text")]
+    use glifo::Glyph;
     use vello_common::kurbo::{Affine, Point, Rect};
     use vello_common::peniko::Color;
+    #[cfg(feature = "text")]
+    use vello_common::peniko::{Blob, FontData};
 
     // These tests serve the purpose of ensuring that the logic for selecting fast paths
     // works correctly.
@@ -1295,6 +1236,38 @@ mod tests {
         assert!(is_rect(&cmds[0]));
         assert!(is_path(&cmds[1]));
         assert!(is_rect(&cmds[2]));
+    }
+
+    #[cfg(feature = "text")]
+    #[test]
+    fn glyph_atlas_resources_are_lazy() {
+        const ROBOTO_FONT: &[u8] =
+            include_bytes!("../../../examples/assets/roboto/Roboto-Regular.ttf");
+
+        let font = FontData::new(Blob::new(Arc::new(ROBOTO_FONT)), 0);
+        let glyphs = [Glyph {
+            id: 1,
+            x: 0.0,
+            y: 0.0,
+        }];
+
+        let mut scene = unconstrained();
+        let mut resources = Resources::new();
+
+        scene.fill_rect(&small_rect());
+        scene.fill_path(&triangle_path());
+        scene
+            .glyph_run(&mut resources, &font)
+            .fill_glyphs(glyphs.into_iter());
+
+        assert!(resources.glyph_resources.is_none());
+
+        scene
+            .glyph_run(&mut resources, &font)
+            .atlas_cache(true)
+            .fill_glyphs(glyphs.into_iter());
+
+        assert!(resources.glyph_resources.is_some());
     }
 
     #[test]
@@ -1472,6 +1445,22 @@ mod tests {
         assert_eq!(scene.strip_path_mode, StripPathMode::Interleaved);
         assert_eq!(scene.coarse_batch_splits.len(), 1);
         assert_eq!(scene.fast_strips_buffer.commands.len(), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "scene constrained to default blending")]
+    fn default_blending_only_rejects_root_blend_layer() {
+        let mut scene = default_blending_only();
+        scene.push_blend_layer(BlendMode::new(Mix::Multiply, Compose::SrcOver));
+    }
+
+    #[test]
+    fn default_blending_only_allows_nested_blend_layer() {
+        let mut scene = default_blending_only();
+        scene.push_layer(None, None, Some(0.5), None, None);
+        scene.push_blend_layer(BlendMode::new(Mix::Multiply, Compose::SrcOver));
+
+        assert!(scene.wide.has_layers());
     }
 
     #[test]

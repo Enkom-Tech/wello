@@ -5,6 +5,10 @@
 
 use crate::RenderMode;
 use crate::dispatch::Dispatcher;
+#[cfg(feature = "text")]
+use crate::text::{GlyphAtlasResources, GlyphRunBuilder};
+#[cfg(feature = "text")]
+use glifo::GlyphPrepCache;
 
 #[cfg(feature = "multithreading")]
 use crate::dispatch::multi_threaded::MultiThreadedDispatcher;
@@ -21,24 +25,121 @@ use vello_common::fearless_simd::Level;
 use vello_common::filter_effects::Filter;
 use vello_common::kurbo::{Affine, BezPath, Rect, Stroke};
 use vello_common::mask::Mask;
-#[cfg(feature = "text")]
-use vello_common::paint::{Image, ImageSource};
 use vello_common::paint::{ImageId, ImageResolver, Paint, PaintType, Tint};
 use vello_common::peniko::color::palette::css::BLACK;
 use vello_common::peniko::{BlendMode, Fill};
-use vello_common::pixmap::Pixmap;
-use vello_common::recording::{
-    PushLayerCommand, Recordable, Recorder, Recording, RenderCommand, RenderState,
-};
-use vello_common::strip::Strip;
-use vello_common::strip_generator::{GenerationMode, StripGenerator, StripStorage};
+use vello_common::pixmap::{Pixmap, PixmapMut};
+use vello_common::render_state::RenderState;
 use vello_common::util::is_axis_aligned;
+
 #[cfg(feature = "text")]
-use vello_common::{
-    color::{AlphaColor, Srgb},
-    colr::{ColrPainter, ColrRenderer},
-    glyph::{GlyphCaches, GlyphRenderer, GlyphRunBuilder, GlyphType, PreparedGlyph},
-};
+pub(crate) const DEFAULT_GLYPH_ATLAS_SIZE: u16 = 4096;
+// Why do we need this? The reason is that the way uploaded images work in Vello Hybrid
+// is different from how they work in Vello CPU.
+//
+// In Vello Hybrid, all images, regardless of whether they are user-uploaded
+// images or cached glyphs, are stored in an image atlas at a certain location. An image ID then
+// uniquely resolves to an atlas page index + a location on that page. Whenever we want to
+// cache a new glyph, we simply allocate a location in the image atlas and then return the image
+// ID associated with that location.
+//
+// On Vello CPU, it works differently: An image ID is associated with a complete pixmap.
+// If a user uploads an image, instead of blitting it into a bigger image atlas, we just
+// store the user-provided pixmap and associate an image ID with the whole pixmap. However,
+// for glyph caching to work we need the same semantics as in Vello Hybrid. Therefore, we
+// use a marker to determine whether an image ID refers to a normal uploaded image or a cached
+// glyph and apply special handling based on that.
+//
+// All IDs < than this value are reserved for normal images, all IDs >= this value are
+// reserved for atlas pages.
+pub(crate) const ATLAS_IMAGE_ID_BASE: u32 = u32::MAX / 2;
+
+/// Persistent resources required by Vello CPU for rendering.
+#[derive(Debug, Default)]
+pub struct Resources {
+    pub(crate) image_registry: ImageRegistry,
+    #[cfg(feature = "text")]
+    pub(crate) glyph_prep_cache: GlyphPrepCache,
+    // Will be initialized lazily on first use.
+    #[cfg(feature = "text")]
+    pub(crate) glyph_resources: Option<GlyphAtlasResources>,
+}
+
+impl Resources {
+    /// Create a new set of renderer resources.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn before_render(&mut self, render_mode: RenderMode) {
+        #[cfg(feature = "text")]
+        self.prepare_glyph_cache(render_mode);
+
+        #[cfg(not(feature = "text"))]
+        let _ = render_mode;
+    }
+
+    pub(crate) fn after_render(&mut self) {
+        #[cfg(feature = "text")]
+        self.maintain_glyph_cache();
+    }
+}
+
+/// The composition mode that should be used when rendering into a pixmap.
+///
+/// For performance reason it is _highly_ recommended that you use `CompositeMode::Replace`, even
+/// if you know that the pixmap is already cleared. Only use `SrcOver` if you really have to
+/// preserve existing contents.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum CompositeMode {
+    /// Clear the destination pixmap and render the scene into it.
+    #[default]
+    Replace,
+    /// Render the scene into the pixmap using src-over compositing.
+    SrcOver,
+}
+
+/// The pixel format to assume for the destination pixmap.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum PixelFormat {
+    /// Premultiplied RGBA8.
+    #[default]
+    Rgba8,
+}
+
+/// Settings used when rasterizing a scene into a pixmap.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct RasterizerSettings {
+    /// Whether to prioritize speed or quality when rendering.
+    ///
+    /// For most cases (especially for real-time rendering), it is highly recommended to set
+    /// this to [`RenderMode::OptimizeSpeed`]. If color accuracy is a more significant concern,
+    /// then you can set this to [`RenderMode::OptimizeQuality`].
+    ///
+    /// Currently, the only difference this makes is that when choosing [`RenderMode::OptimizeSpeed`],
+    /// rasterization will happen using u8/u16,
+    /// while [`RenderMode::OptimizeQuality`] will use a f32-based pipeline.
+    pub render_mode: RenderMode,
+    /// How rendered content is composited into the destination.
+    pub composite_mode: CompositeMode,
+    /// Pixel format of the destination.
+    pub pixel_format: PixelFormat,
+    /// Offset in destination pixels where the render context origin is placed.
+    ///
+    /// See [`RenderContext::render_with`] for more information.
+    pub offset: (u16, u16),
+}
+
+impl Default for RasterizerSettings {
+    fn default() -> Self {
+        Self {
+            render_mode: RenderMode::OptimizeSpeed,
+            composite_mode: CompositeMode::Replace,
+            pixel_format: PixelFormat::Rgba8,
+            offset: (0, 0),
+        }
+    }
+}
 
 /// A render context for CPU-based 2D graphics rendering.
 ///
@@ -67,10 +168,6 @@ pub struct RenderContext {
     )]
     pub(crate) render_settings: RenderSettings,
     dispatcher: Box<dyn Dispatcher>,
-    #[cfg(feature = "text")]
-    pub(crate) glyph_caches: Option<GlyphCaches>,
-    /// Registry for resolving `ImageSource::OpaqueId` to pixmap data.
-    image_registry: ImageRegistry,
 }
 
 /// Settings to apply to the render context.
@@ -81,15 +178,6 @@ pub struct RenderSettings {
     /// The number of worker threads that should be used for rendering. Only has an effect
     /// if the `multithreading` feature is active.
     pub num_threads: u16,
-    /// Whether to prioritize speed or quality when rendering.
-    ///
-    /// For most cases (especially for real-time rendering), it is highly recommended to set
-    /// this to `OptimizeSpeed`. If accuracy is a more significant concern (for example for visual
-    /// regression testing), then you can set this to `OptimizeQuality`.
-    ///
-    /// Currently, the only difference this makes is that when choosing `OptimizeSpeed`, rasterization
-    /// will happen using u8/u16, while `OptimizeQuality` will use a f32-based pipeline.
-    pub render_mode: RenderMode,
 }
 
 impl Default for RenderSettings {
@@ -104,7 +192,6 @@ impl Default for RenderSettings {
                 .min(8),
             #[cfg(not(feature = "multithreading"))]
             num_threads: 0,
-            render_mode: RenderMode::OptimizeSpeed,
         }
     }
 }
@@ -148,9 +235,6 @@ impl RenderContext {
             temp_path,
             encoded_paints,
             filter: None,
-            #[cfg(feature = "text")]
-            glyph_caches: Some(GlyphCaches::default()),
-            image_registry: ImageRegistry::new(),
         }
     }
 
@@ -278,6 +362,7 @@ impl RenderContext {
     /// Note that this only works properly if the current paint is set to a solid color.
     /// If not, it will fall back to using black as the fill color.
     pub fn fill_blurred_rounded_rect(&mut self, rect: &Rect, radius: f32, std_dev: f32) {
+        let rect = rect.abs();
         let color = match self.state.paint {
             PaintType::Solid(s) => s,
             // Fallback to black when attempting to blur a rectangle with an image/gradient paint
@@ -285,7 +370,7 @@ impl RenderContext {
         };
 
         let blurred_rect = BlurredRoundedRectangle {
-            rect: *rect,
+            rect,
             color,
             radius,
             std_dev,
@@ -316,8 +401,21 @@ impl RenderContext {
 
     /// Creates a builder for drawing a run of glyphs that have the same attributes.
     #[cfg(feature = "text")]
-    pub fn glyph_run(&mut self, font: &crate::peniko::FontData) -> GlyphRunBuilder<'_, Self> {
-        GlyphRunBuilder::new(font.clone(), self.state.transform, self)
+    pub fn glyph_run<'a>(
+        &'a mut self,
+        resources: &'a mut Resources,
+        font: &crate::peniko::FontData,
+    ) -> GlyphRunBuilder<'a> {
+        glifo::GlyphRunBuilder::new(
+            font.clone(),
+            self.state.transform,
+            self.state.paint_transform,
+            crate::text::CpuGlyphRunBackend {
+                ctx: self,
+                resources,
+                atlas_cache_enabled: false,
+            },
+        )
     }
 
     /// Push a new layer with the given properties.
@@ -418,16 +516,22 @@ impl RenderContext {
         self.state.stroke = stroke;
     }
 
-    /// Get the current stroke
+    /// Get the current stroke.
     pub fn stroke(&self) -> &Stroke {
         &self.state.stroke
+    }
+
+    /// Get a mutable reference to the current stroke.
+    #[cfg(feature = "text")]
+    pub(crate) fn stroke_mut(&mut self) -> &mut Stroke {
+        &mut self.state.stroke
     }
 
     /// Set the current paint.
     ///
     /// If the paint is an image with `ImageSource::OpaqueId`, it will be
     /// resolved to the corresponding pixmap at rasterization time.
-    /// Make sure to register images with [`register_image`](Self::register_image) first.
+    /// Make sure to register images with [`Resources::register_image`] first.
     pub fn set_paint(&mut self, paint: impl Into<PaintType>) {
         self.state.paint = paint.into();
     }
@@ -535,9 +639,6 @@ impl RenderContext {
         self.encoded_paints.clear();
         self.mask = None;
         self.state.reset();
-        #[cfg(feature = "text")]
-        self.glyph_caches.as_mut().unwrap().maintain();
-        self.clear_images();
     }
 
     /// Push a new clip path to the clip stack.
@@ -570,89 +671,90 @@ impl RenderContext {
         self.dispatcher.flush(&self.encoded_paints);
     }
 
-    /// Render the current context into a buffer.
-    /// The buffer is expected to be in premultiplied RGBA8 format with length `width * height * 4`
-    pub fn render_to_buffer(
+    /// Render the current context into a target using default rasterizer settings.
+    ///
+    /// See the documentation of [`RenderContext::render_with`] for more information.
+    pub fn render<'a>(&self, target: impl Into<PixmapMut<'a>>, resources: &mut Resources) {
+        self.render_with(target, resources, RasterizerSettings::default());
+    }
+
+    /// Render the current context into a target using custom rasterizer settings.
+    ///
+    /// See the documentation of [`RasterizerSettings`] to understand the tunable parameters for
+    /// rasterization.
+    ///
+    /// There is an important note to make about render sizes. [`RenderContext`] can be configured with
+    /// a specific width/height, but so can [`Pixmap`]. In the vast majority of cases, you will simply
+    /// want to configure them both to have the same size. However, it _is_ very much possible for them
+    /// to have different sizes, which can be useful in certain situations. In principle, the size
+    /// that you specify when creating a [`RenderContext`] defines the bound of the scene itself. Any
+    /// content that is to the top/left of (0, 0) and to the right/bottom of (width/height) will be
+    /// removed. However, the offset in [`RasterizerSettings`] as well as the width/height of
+    /// the [`PixmapMut`] define at which location the scene will be rasterized into, and allows
+    /// for further clipping certain parts of the scene away. The semantics are defined as follows:
+    ///
+    /// 1. [`RasterizerSettings::offset`] defines the where the top-left corner will be positioned
+    ///    on the pixmap, assuming a y-down coordinate system. In most cases (0, 0) will be the
+    ///    appropriate choice, but other values are certainly sensible. For example, if you want to
+    ///    implement a custom glyph-atlas, you can construct the scene assuming (0, 0) as the origin
+    ///    and then position the glyphs at rasterization time using this feature.
+    ///
+    /// 2. In case the pixmap width/height is larger than the offset plus the width/height of the
+    ///    [`RenderContext`], any remaining rows/columns are simply treated as padding (**however**,
+    ///    when using [`CompositeMode::Replace`], then the _whole_ destination pixmap will
+    ///    be cleared, not just the area covered by the scene). One potential reason for doing this
+    ///    is that certain platforms, for example macOS, require a specific byte stride for buffers.
+    ///    For example, let's say that a byte stride of 128 is imposed by the platform, but the actual
+    ///    size of the scene you are drawing is only 20x20. In this case, you can create a pixmap
+    ///    of size 32x20, and the last 12 columns are essentially treated as padding.
+    ///
+    /// 3. In case the width/height of the pixmap is _smaller_ than the offset + width/height of the
+    ///    scene, then anything that exceeds the pixmap boundaries is simply cut off. This can be useful
+    ///    if for some reason you only want to rasterize a small cut-out of the original scene.
+    pub fn render_with<'a>(
         &self,
-        buffer: &mut [u8],
-        width: u16,
-        height: u16,
-        render_mode: RenderMode,
+        target: impl Into<PixmapMut<'a>>,
+        resources: &mut Resources,
+        settings: RasterizerSettings,
     ) {
         // TODO: Maybe we should move those checks into the dispatcher.
         let wide = self.dispatcher.wide();
         assert!(!wide.has_layers(), "some layers haven't been popped yet");
-        assert_eq!(
-            buffer.len(),
-            (width as usize) * (height as usize) * 4,
-            "provided width ({}) and height ({}) do not match buffer size ({})",
-            width,
-            height,
-            buffer.len(),
-        );
+
+        resources.before_render(settings.render_mode);
+        let mut target = target.into();
+        let target_fully_covered = settings.offset == (0, 0)
+            && self.width >= target.width()
+            && self.height >= target.height();
+        // If the scene covers the whole pixmap than packing will take care
+        // of clearing everything anyway, so no reason to clear it explicitly
+        // here.
+        if settings.composite_mode == CompositeMode::Replace && !target_fully_covered {
+            target.data_mut().fill(0);
+        }
 
         self.dispatcher.rasterize(
-            buffer,
-            render_mode,
-            width,
-            height,
-            &self.encoded_paints,
-            &self.image_registry,
-        );
-    }
-
-    /// Render the current context into a pixmap.
-    pub fn render_to_pixmap(&self, pixmap: &mut Pixmap) {
-        let width = pixmap.width();
-        let height = pixmap.height();
-        self.render_to_buffer(
-            pixmap.data_as_u8_slice_mut(),
-            width,
-            height,
-            self.render_settings.render_mode,
-        );
-    }
-
-    /// Composite the current context into a region of a pixmap.
-    ///
-    /// The context's content (sized `self.width × self.height`) is composited
-    /// directly to the destination pixmap starting at `(dst_x, dst_y)`.
-    /// If the region extends beyond the pixmap bounds, it is clipped.
-    ///
-    /// Unlike [`render_to_pixmap`](Self::render_to_pixmap), this method composites on top of
-    /// existing pixmap content rather than clearing it first, allowing multiple
-    /// renders to accumulate.
-    ///
-    /// This is useful for rendering individual elements (like glyphs) into
-    /// a spritesheet at specific coordinates.
-    ///
-    /// # Panics
-    ///
-    /// This method is only supported with the single-threaded dispatcher and will
-    /// **panic** if called on a `RenderContext` using the multi-threaded dispatcher.
-    pub fn composite_to_pixmap_at_offset(&self, pixmap: &mut Pixmap, dst_x: u16, dst_y: u16) {
-        let dst_buffer_width = pixmap.width();
-        let dst_buffer_height = pixmap.height();
-        self.dispatcher.composite_at_offset(
-            pixmap.data_as_u8_slice_mut(),
+            target,
             self.width,
             self.height,
-            dst_x,
-            dst_y,
-            dst_buffer_width,
-            dst_buffer_height,
-            self.render_settings.render_mode,
+            settings,
             &self.encoded_paints,
-            &self.image_registry,
+            &resources.image_registry,
         );
+        // TODO: We need to figure something out here API-wise. At the moment, the user can
+        // theoretically rasterize the same `RenderContext` multiple times without resetting in-between.
+        // However, if glyph caching is enabled, this method call could now evict that were previously
+        // assumed to exist in `RenderContext`, meaning that if the user rasterizes the same `RenderContext`
+        // again without resetting it, some of the cached glyphs might be stale and not exist anymore.
+        resources.after_render();
     }
 
-    /// Return the width of the pixmap.
+    /// Return the width of the scene.
     pub fn width(&self) -> u16 {
         self.width
     }
 
-    /// Return the height of the pixmap.
+    /// Return the height of the scene.
     pub fn height(&self) -> u16 {
         self.height
     }
@@ -690,10 +792,15 @@ impl RenderContext {
     pub fn restore_state(&mut self, state: RenderState) {
         self.state = state;
     }
+
+    /// Whether rendering is currently configured to run in multi-threaded mode.
+    pub fn is_multi_threaded(&self) -> bool {
+        self.dispatcher.is_multi_threaded()
+    }
 }
 
 /// Image registry implementation.
-impl RenderContext {
+impl Resources {
     /// Register a pixmap in the image registry and return its [`ImageId`].
     pub fn register_image(&mut self, pixmap: Arc<Pixmap>) -> ImageId {
         self.image_registry.register(pixmap)
@@ -715,330 +822,43 @@ impl RenderContext {
     }
 }
 
-#[cfg(feature = "text")]
-impl GlyphRenderer for RenderContext {
-    fn fill_glyph(&mut self, prepared_glyph: PreparedGlyph<'_>) {
-        match prepared_glyph.glyph_type {
-            GlyphType::Outline(glyph) => {
-                let paint = self.encode_current_paint();
-                self.dispatcher.fill_path(
-                    glyph.path,
-                    Fill::NonZero,
-                    prepared_glyph.transform,
-                    paint,
-                    self.state.blend_mode,
-                    self.aliasing_threshold,
-                    self.mask.clone(),
-                    &self.encoded_paints,
-                );
-            }
-            GlyphType::Bitmap(glyph) => {
-                // We need to change the state of the render context
-                // to render the bitmap, but don't want to pollute the context,
-                // so simulate a `save` and `restore` operation.
-
-                use vello_common::peniko::ImageSampler;
-                let old_transform = self.state.transform;
-                let old_paint = self.state.paint.clone();
-
-                // If we scale down by a large factor, fall back to cubic scaling.
-                let quality = if prepared_glyph.transform.as_coeffs()[0] < 0.5
-                    || prepared_glyph.transform.as_coeffs()[3] < 0.5
-                {
-                    crate::peniko::ImageQuality::High
-                } else {
-                    crate::peniko::ImageQuality::Medium
-                };
-
-                let image = Image {
-                    image: ImageSource::Pixmap(Arc::new(glyph.pixmap)),
-                    sampler: ImageSampler {
-                        x_extend: crate::peniko::Extend::Pad,
-                        y_extend: crate::peniko::Extend::Pad,
-                        quality,
-                        alpha: 1.0,
-                    },
-                };
-
-                self.set_paint(image);
-                self.set_transform(prepared_glyph.transform);
-                self.fill_rect(&glyph.area);
-
-                // Restore the state.
-                self.set_paint(old_paint);
-                self.state.transform = old_transform;
-            }
-            GlyphType::Colr(glyph) => {
-                // Same as for bitmap glyphs, save the state and restore it later on.
-
-                use vello_common::peniko::ImageSampler;
-                let old_transform = self.state.transform;
-                let old_paint = self.state.paint.clone();
-                let context_color = match old_paint {
-                    PaintType::Solid(s) => s,
-                    _ => BLACK,
-                };
-
-                let area = glyph.area;
-
-                let glyph_pixmap = {
-                    let settings = RenderSettings {
-                        level: self.render_settings.level,
-                        render_mode: self.render_settings.render_mode,
-                        num_threads: 0,
-                    };
-
-                    let mut ctx = Self::new_with(glyph.pix_width, glyph.pix_height, settings);
-                    let mut pix = Pixmap::new(glyph.pix_width, glyph.pix_height);
-
-                    let mut colr_painter = ColrPainter::new(glyph, context_color, &mut ctx);
-                    colr_painter.paint();
-
-                    // Technically not necessary since we always render single-threaded, but just
-                    // to be safe.
-                    ctx.flush();
-                    ctx.render_to_pixmap(&mut pix);
-
-                    pix
-                };
-
-                let has_skew = prepared_glyph.transform.as_coeffs()[1] != 0.0
-                    || prepared_glyph.transform.as_coeffs()[2] != 0.0;
-
-                let image = Image {
-                    image: ImageSource::Pixmap(Arc::new(glyph_pixmap)),
-                    sampler: ImageSampler {
-                        x_extend: crate::peniko::Extend::Pad,
-                        y_extend: crate::peniko::Extend::Pad,
-
-                        quality: if has_skew {
-                            // Even though the pixmap has the "correct" size, the skewing
-                            // might cause aliasing artifacts since the pixels don't map
-                            // perfectly to the pixmap, so we use bilinear scaling here.
-                            crate::peniko::ImageQuality::Medium
-                        } else {
-                            // Since the pixmap will already have the correct size, no need to
-                            // use a different image quality here.
-                            crate::peniko::ImageQuality::Low
-                        },
-                        alpha: 1.0,
-                    },
-                };
-
-                self.set_paint(image);
-                self.set_transform(prepared_glyph.transform);
-                self.fill_rect(&area);
-
-                // Restore the state.
-                self.set_paint(old_paint);
-                self.state.transform = old_transform;
-            }
-        }
-    }
-
-    fn stroke_glyph(&mut self, prepared_glyph: PreparedGlyph<'_>) {
-        match prepared_glyph.glyph_type {
-            GlyphType::Outline(glyph) => {
-                let paint = self.encode_current_paint();
-                self.dispatcher.stroke_path(
-                    glyph.path,
-                    &self.state.stroke,
-                    prepared_glyph.transform,
-                    paint,
-                    self.state.blend_mode,
-                    self.aliasing_threshold,
-                    self.mask.clone(),
-                    &self.encoded_paints,
-                );
-            }
-            GlyphType::Bitmap(_) | GlyphType::Colr(_) => {
-                // The definitions of COLR and bitmap glyphs can't meaningfully support being stroked.
-                // (COLR's imaging model only has fills)
-                self.fill_glyph(prepared_glyph);
-            }
-        }
-    }
-
-    fn take_glyph_caches(&mut self) -> GlyphCaches {
-        self.glyph_caches.take().unwrap()
-    }
-
-    fn restore_glyph_caches(&mut self, cache: GlyphCaches) {
-        self.glyph_caches = Some(cache);
-    }
-}
-
-#[cfg(feature = "text")]
-impl ColrRenderer for RenderContext {
-    fn push_clip_layer(&mut self, clip: &BezPath) {
-        Self::push_clip_layer(self, clip);
-    }
-
-    fn push_blend_layer(&mut self, blend_mode: BlendMode) {
-        Self::push_blend_layer(self, blend_mode);
-    }
-
-    fn fill_solid(&mut self, color: AlphaColor<Srgb>) {
-        self.set_paint(color);
-        self.fill_rect(&Rect::new(
-            0.0,
-            0.0,
-            f64::from(self.width),
-            f64::from(self.height),
-        ));
-    }
-
-    fn fill_gradient(&mut self, gradient: crate::peniko::Gradient) {
-        self.set_paint(gradient);
-        self.fill_rect(&Rect::new(
-            0.0,
-            0.0,
-            f64::from(self.width),
-            f64::from(self.height),
-        ));
-    }
-
-    fn set_paint_transform(&mut self, affine: Affine) {
-        Self::set_paint_transform(self, affine);
-    }
-
-    fn pop_layer(&mut self) {
-        Self::pop_layer(self);
-    }
-}
-
-impl Recordable for RenderContext {
-    fn record<F>(&mut self, recording: &mut Recording, f: F)
-    where
-        F: FnOnce(&mut Recorder<'_>),
-    {
-        let mut recorder = Recorder::new(
-            recording,
-            self.state.transform,
-            #[cfg(feature = "text")]
-            self.take_glyph_caches(),
-        );
-        f(&mut recorder);
-        #[cfg(feature = "text")]
-        {
-            self.glyph_caches = Some(recorder.take_glyph_caches());
-        }
-    }
-
-    fn prepare_recording(&mut self, recording: &mut Recording) {
-        let buffers = recording.take_cached_strips();
-        let (strip_storage, strip_start_indices) =
-            self.generate_strips_from_commands(recording.commands(), buffers);
-        recording.set_cached_strips(strip_storage, strip_start_indices);
-    }
-
-    fn execute_recording(&mut self, recording: &Recording) {
-        let (cached_strips, cached_alphas) = recording.get_cached_strips();
-        let adjusted_strips = self.prepare_cached_strips(cached_strips, cached_alphas);
-
-        // Use pre-calculated strip start indices from when we generated the cache.
-        let strip_start_indices = recording.get_strip_start_indices();
-        let mut range_index = 0;
-
-        // Replay commands in order, using cached strips for geometry.
-        for command in recording.commands() {
-            match command {
-                RenderCommand::FillPath(_)
-                | RenderCommand::StrokePath(_)
-                | RenderCommand::FillRect(_)
-                | RenderCommand::StrokeRect(_) => {
-                    self.process_geometry_command(
-                        strip_start_indices,
-                        range_index,
-                        &adjusted_strips,
-                    );
-                    range_index += 1;
-                }
-                #[cfg(feature = "text")]
-                RenderCommand::FillOutlineGlyph(_) | RenderCommand::StrokeOutlineGlyph(_) => {
-                    self.process_geometry_command(
-                        strip_start_indices,
-                        range_index,
-                        &adjusted_strips,
-                    );
-                    range_index += 1;
-                }
-                RenderCommand::SetPaint(paint) => {
-                    self.set_paint(paint.clone());
-                }
-                RenderCommand::SetPaintTransform(transform) => {
-                    self.set_paint_transform(*transform);
-                }
-                RenderCommand::ResetPaintTransform => {
-                    self.reset_paint_transform();
-                }
-                RenderCommand::SetTransform(transform) => {
-                    self.set_transform(*transform);
-                }
-                RenderCommand::SetFillRule(fill_rule) => {
-                    self.set_fill_rule(*fill_rule);
-                }
-                RenderCommand::SetStroke(stroke) => {
-                    self.set_stroke(stroke.clone());
-                }
-                RenderCommand::SetTint(tint) => {
-                    self.set_tint(*tint);
-                }
-                RenderCommand::SetFilterEffect(filter) => {
-                    self.set_filter_effect(filter.clone());
-                }
-                RenderCommand::ResetFilterEffect => {
-                    self.reset_filter_effect();
-                }
-                RenderCommand::PushLayer(PushLayerCommand {
-                    clip_path,
-                    blend_mode,
-                    opacity,
-                    mask,
-                    filter,
-                }) => {
-                    self.push_layer(
-                        clip_path.as_ref(),
-                        *blend_mode,
-                        *opacity,
-                        mask.clone(),
-                        filter.clone(),
-                    );
-                }
-                RenderCommand::PopLayer => {
-                    self.pop_layer();
-                }
-            }
-        }
-    }
-}
-
 /// Registry that maps opaque [`ImageId`]s to [`Pixmap`] data.
 ///
 /// Used by [`RenderContext`] to resolve `ImageSource::OpaqueId` at rasterization time.
-#[derive(Debug)]
-struct ImageRegistry {
+#[derive(Debug, Default)]
+pub(crate) struct ImageRegistry {
     images: HashMap<u32, Arc<Pixmap>>,
     next_id: u32,
 }
 
 impl ImageRegistry {
-    fn new() -> Self {
-        Self {
-            images: HashMap::new(),
-            next_id: 0,
-        }
-    }
-
     fn register(&mut self, pixmap: Arc<Pixmap>) -> ImageId {
         let id = self.next_id;
+        assert!(
+            id < ATLAS_IMAGE_ID_BASE,
+            "image registry exhausted non-atlas image IDs"
+        );
+
         self.next_id += 1;
         self.images.insert(id, pixmap);
         ImageId::new(id)
     }
 
-    fn destroy(&mut self, id: ImageId) -> bool {
+    #[cfg(feature = "text")]
+    pub(crate) fn register_atlas_page(&mut self, page_index: u32, pixmap: Arc<Pixmap>) {
+        self.images.insert(
+            ImageId::new(ATLAS_IMAGE_ID_BASE + page_index).as_u32(),
+            pixmap,
+        );
+    }
+
+    pub(crate) fn destroy(&mut self, id: ImageId) -> bool {
         self.images.remove(&id.as_u32()).is_some()
+    }
+
+    #[cfg(feature = "text")]
+    pub(crate) fn destroy_atlas_page(&mut self, page_index: u32) -> bool {
+        self.destroy(ImageId::new(ATLAS_IMAGE_ID_BASE + page_index))
     }
 
     fn resolve(&self, id: ImageId) -> Option<Arc<Pixmap>> {
@@ -1057,189 +877,56 @@ impl ImageResolver for ImageRegistry {
     }
 }
 
-/// Recording management implementation.
-impl RenderContext {
-    /// Generate strips from strip commands and capture ranges.
-    ///
-    /// Returns:
-    /// - `collected_strips`: The generated strips.
-    /// - `collected_alphas`: The generated alphas.
-    /// - `strip_start_indices`: The start indices of strips for each geometry command.
-    fn generate_strips_from_commands(
-        &mut self,
-        commands: &[RenderCommand],
-        buffers: (StripStorage, Vec<usize>),
-    ) -> (StripStorage, Vec<usize>) {
-        let (mut strip_storage, mut strip_start_indices) = buffers;
-        strip_storage.clear();
-        strip_storage.set_generation_mode(GenerationMode::Append);
-        strip_start_indices.clear();
-
-        let saved_state = self.take_current_state();
-        let mut strip_generator =
-            StripGenerator::new(self.width, self.height, self.render_settings.level);
-
-        for command in commands {
-            let start_index = strip_storage.strips.len();
-
-            match command {
-                RenderCommand::FillPath(path) => {
-                    strip_generator.generate_filled_path(
-                        path,
-                        self.state.fill_rule,
-                        self.state.transform,
-                        self.aliasing_threshold,
-                        &mut strip_storage,
-                        None,
-                    );
-                    strip_start_indices.push(start_index);
-                }
-                RenderCommand::StrokePath(path) => {
-                    strip_generator.generate_stroked_path(
-                        path,
-                        &self.state.stroke,
-                        self.state.transform,
-                        self.aliasing_threshold,
-                        &mut strip_storage,
-                        None,
-                    );
-                    strip_start_indices.push(start_index);
-                }
-                RenderCommand::FillRect(rect) => {
-                    self.rect_to_temp_path(rect);
-                    strip_generator.generate_filled_path(
-                        &self.temp_path,
-                        self.state.fill_rule,
-                        self.state.transform,
-                        self.aliasing_threshold,
-                        &mut strip_storage,
-                        None,
-                    );
-                    strip_start_indices.push(start_index);
-                }
-                RenderCommand::StrokeRect(rect) => {
-                    self.rect_to_temp_path(rect);
-                    strip_generator.generate_stroked_path(
-                        &self.temp_path,
-                        &self.state.stroke,
-                        self.state.transform,
-                        self.aliasing_threshold,
-                        &mut strip_storage,
-                        None,
-                    );
-                    strip_start_indices.push(start_index);
-                }
-                #[cfg(feature = "text")]
-                RenderCommand::FillOutlineGlyph((path, glyph_transform)) => {
-                    strip_generator.generate_filled_path(
-                        path,
-                        self.state.fill_rule,
-                        *glyph_transform,
-                        self.aliasing_threshold,
-                        &mut strip_storage,
-                        None,
-                    );
-                    strip_start_indices.push(start_index);
-                }
-                #[cfg(feature = "text")]
-                RenderCommand::StrokeOutlineGlyph((path, glyph_transform)) => {
-                    strip_generator.generate_stroked_path(
-                        path,
-                        &self.state.stroke,
-                        *glyph_transform,
-                        self.aliasing_threshold,
-                        &mut strip_storage,
-                        None,
-                    );
-                    strip_start_indices.push(start_index);
-                }
-                RenderCommand::SetTransform(transform) => {
-                    self.state.transform = *transform;
-                }
-                RenderCommand::SetFillRule(fill_rule) => {
-                    self.state.fill_rule = *fill_rule;
-                }
-                RenderCommand::SetStroke(stroke) => {
-                    self.state.stroke = stroke.clone();
-                }
-
-                _ => {}
-            }
-        }
-
-        self.restore_state(saved_state);
-
-        (strip_storage, strip_start_indices)
-    }
-}
-
-/// Recording management implementation.
-impl RenderContext {
-    fn process_geometry_command(
-        &mut self,
-        strip_start_indices: &[usize],
-        range_index: usize,
-        adjusted_strips: &[Strip],
-    ) {
-        assert!(
-            range_index < strip_start_indices.len(),
-            "Strip range index out of bounds"
-        );
-        let start = strip_start_indices[range_index];
-        let end = strip_start_indices
-            .get(range_index + 1)
-            .copied()
-            .unwrap_or(adjusted_strips.len());
-        let count = end - start;
-        if count == 0 {
-            // There are no strips to generate.
-            return;
-        }
-        assert!(
-            start < adjusted_strips.len() && count > 0,
-            "Invalid strip range"
-        );
-        let paint = self.encode_current_paint();
-        self.dispatcher.generate_wide_cmd(
-            &adjusted_strips[start..end],
-            paint,
-            self.state.blend_mode,
-            &self.encoded_paints,
-        );
-    }
-
-    /// Prepare cached strips for rendering by adjusting indices.
-    fn prepare_cached_strips(
-        &mut self,
-        cached_strips: &[Strip],
-        cached_alphas: &[u8],
-    ) -> Vec<Strip> {
-        // Calculate offset for alpha indices based on current dispatcher's alpha buffer size.
-        let alpha_offset = {
-            let storage = self.dispatcher.strip_storage_mut();
-            let offset = storage.alphas.len() as u32;
-            // Extend the dispatcher's alpha buffer with cached alphas.
-            storage.alphas.extend(cached_alphas);
-
-            offset
-        };
-        // Create adjusted strips with corrected alpha indices.
-        cached_strips
-            .iter()
-            .map(move |strip| {
-                let mut adjusted_strip = *strip;
-                adjusted_strip.set_alpha_idx(adjusted_strip.alpha_idx() + alpha_offset);
-                adjusted_strip
-            })
-            .collect()
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use crate::RenderContext;
+    #[cfg(feature = "text")]
+    use crate::peniko::{Blob, FontData};
+    use crate::{CompositeMode, RasterizerSettings, RenderContext, Resources};
+    #[cfg(feature = "text")]
+    use alloc::sync::Arc;
+    use alloc::vec;
+    #[cfg(feature = "text")]
+    use glifo::Glyph;
+    use vello_common::color::PremulRgba8;
+    use vello_common::color::palette::css::{BLUE, RED};
     use vello_common::kurbo::{Rect, Shape};
+    use vello_common::pixmap::{Pixmap, PixmapMut};
     use vello_common::tile::Tile;
+
+    const GRAY: PremulRgba8 = PremulRgba8 {
+        r: 9,
+        g: 10,
+        b: 11,
+        a: 255,
+    };
+
+    fn red_pixel() -> PremulRgba8 {
+        RED.premultiply().to_rgba8()
+    }
+
+    fn blue_pixel() -> PremulRgba8 {
+        BLUE.premultiply().to_rgba8()
+    }
+
+    fn transparent_pixel() -> PremulRgba8 {
+        PremulRgba8::from_u32(0)
+    }
+
+    fn solid_pixmap(width: u16, height: u16, color: PremulRgba8) -> Pixmap {
+        Pixmap::from_parts(
+            vec![color; usize::from(width) * usize::from(height)],
+            width,
+            height,
+        )
+    }
+
+    fn red_rect_context(width: u16, height: u16, rect: Rect) -> RenderContext {
+        let mut ctx = RenderContext::new(width, height);
+        ctx.set_paint(RED);
+        ctx.fill_rect(&rect);
+        ctx.flush();
+        ctx
+    }
 
     #[test]
     fn clip_overflow() {
@@ -1254,25 +941,225 @@ mod tests {
         ctx.flush();
     }
 
+    #[test]
+    fn render_with_offset_clears_pixels_outside_scene() {
+        let ctx = red_rect_context(2, 2, Rect::new(0.0, 0.0, 2.0, 2.0));
+        let mut resources = Resources::new();
+        let mut pixmap = solid_pixmap(4, 3, GRAY);
+
+        ctx.render_with(
+            &mut pixmap,
+            &mut resources,
+            RasterizerSettings {
+                offset: (1, 1),
+                ..Default::default()
+            },
+        );
+
+        for y in 0..3 {
+            for x in 0..4 {
+                let expected = if (1..=2).contains(&x) && (1..=2).contains(&y) {
+                    red_pixel()
+                } else {
+                    transparent_pixel()
+                };
+
+                assert_eq!(pixmap.sample(x, y), expected, "pixel at ({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    fn render_clips_scene_to_target_bounds() {
+        let ctx = red_rect_context(3, 3, Rect::new(0.0, 0.0, 3.0, 3.0));
+        let mut resources = Resources::new();
+        let mut pixmap = solid_pixmap(4, 4, GRAY);
+
+        ctx.render_with(
+            &mut pixmap,
+            &mut resources,
+            RasterizerSettings {
+                offset: (2, 1),
+                ..Default::default()
+            },
+        );
+
+        for y in 0..4 {
+            for x in 0..4 {
+                let expected = if (2..=3).contains(&x) && (1..=3).contains(&y) {
+                    red_pixel()
+                } else {
+                    transparent_pixel()
+                };
+                assert_eq!(pixmap.sample(x, y), expected, "pixel at ({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    fn render_into_padded_pixmap() {
+        let ctx = red_rect_context(2, 2, Rect::new(0.0, 0.0, 2.0, 2.0));
+        let mut resources = Resources::new();
+        let mut pixmap = solid_pixmap(4, 2, GRAY);
+
+        ctx.render(&mut pixmap, &mut resources);
+
+        for y in 0..2 {
+            for x in 0..4 {
+                let expected = if x < 2 {
+                    red_pixel()
+                } else {
+                    transparent_pixel()
+                };
+                assert_eq!(pixmap.sample(x, y), expected, "pixel at ({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    fn render_into_raw_buffer() {
+        let ctx = red_rect_context(2, 1, Rect::new(0.0, 0.0, 2.0, 1.0));
+        let mut resources = Resources::new();
+        let mut buffer = vec![0; 3 * 2 * 4];
+        for pixel in buffer.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&[GRAY.r, GRAY.g, GRAY.b, GRAY.a]);
+        }
+
+        {
+            let pixmap = PixmapMut::new(3, 2, &mut buffer).unwrap();
+            ctx.render_with(
+                pixmap,
+                &mut resources,
+                RasterizerSettings {
+                    offset: (1, 1),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let expected = [
+            transparent_pixel(),
+            transparent_pixel(),
+            transparent_pixel(),
+            transparent_pixel(),
+            red_pixel(),
+            red_pixel(),
+        ];
+        for (pixel, expected) in buffer.chunks_exact(4).zip(expected) {
+            assert_eq!(pixel, [expected.r, expected.g, expected.b, expected.a]);
+        }
+    }
+
+    #[test]
+    fn pixmap_mut_validates_buffer_length() {
+        let mut short_buffer = vec![0; 3 * 2 * 4 - 1];
+        assert!(PixmapMut::new(3, 2, &mut short_buffer).is_none());
+
+        let mut exact_buffer = vec![0; 3 * 2 * 4];
+        assert!(PixmapMut::new(3, 2, &mut exact_buffer).is_some());
+    }
+
+    #[test]
+    fn render_src_over_opaque() {
+        let ctx = red_rect_context(2, 1, Rect::new(0.0, 0.0, 1.0, 1.0));
+        let mut resources = Resources::new();
+        let mut pixmap = solid_pixmap(2, 1, blue_pixel());
+
+        ctx.render_with(
+            &mut pixmap,
+            &mut resources,
+            RasterizerSettings {
+                composite_mode: CompositeMode::SrcOver,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(pixmap.sample(0, 0), red_pixel());
+        assert_eq!(pixmap.sample(1, 0), blue_pixel());
+    }
+
+    #[test]
+    fn render_src_over_transparent() {
+        let mut ctx = RenderContext::new(1, 1);
+        ctx.set_paint(RED.with_alpha(0.5));
+        ctx.fill_rect(&Rect::new(0.0, 0.0, 1.0, 1.0));
+        ctx.flush();
+
+        let mut resources = Resources::new();
+        let mut pixmap = solid_pixmap(1, 1, blue_pixel());
+
+        ctx.render_with(
+            &mut pixmap,
+            &mut resources,
+            RasterizerSettings {
+                composite_mode: CompositeMode::SrcOver,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            pixmap.sample(0, 0),
+            PremulRgba8 {
+                r: 128,
+                g: 0,
+                b: 127,
+                a: 255,
+            }
+        );
+    }
+
     #[cfg(feature = "multithreading")]
     #[test]
     fn multithreaded_crash_after_reset() {
-        use crate::{Level, RenderMode, RenderSettings};
-        use vello_common::pixmap::Pixmap;
+        use crate::{Level, RasterizerSettings, RenderMode, RenderSettings};
 
         let mut pixmap = Pixmap::new(200, 200);
         let settings = RenderSettings {
             level: Level::try_detect().unwrap_or(Level::baseline()),
             num_threads: 1,
+        };
+        let rasterizer_settings = RasterizerSettings {
             render_mode: RenderMode::OptimizeQuality,
+            ..Default::default()
         };
 
+        let mut resources = Resources::new();
         let mut ctx = RenderContext::new_with(200, 200, settings);
         ctx.reset();
         ctx.fill_path(&Rect::new(0.0, 0.0, 100.0, 100.0).to_path(0.1));
         ctx.flush();
-        ctx.render_to_pixmap(&mut pixmap);
+        ctx.render_with(&mut pixmap, &mut resources, rasterizer_settings);
         ctx.flush();
-        ctx.render_to_pixmap(&mut pixmap);
+        ctx.render_with(&mut pixmap, &mut resources, rasterizer_settings);
+    }
+
+    #[cfg(feature = "text")]
+    #[test]
+    fn glyph_atlas_resources_are_lazy() {
+        const ROBOTO_FONT: &[u8] =
+            include_bytes!("../../../examples/assets/roboto/Roboto-Regular.ttf");
+
+        let font = FontData::new(Blob::new(Arc::new(ROBOTO_FONT)), 0);
+        let glyphs = [Glyph {
+            id: 1,
+            x: 0.0,
+            y: 0.0,
+        }];
+
+        let mut resources = Resources::new();
+        let mut ctx = RenderContext::new(100, 100);
+
+        ctx.fill_rect(&Rect::new(0.0, 0.0, 10.0, 10.0));
+        ctx.fill_path(&Rect::new(10.0, 10.0, 20.0, 20.0).to_path(0.1));
+        ctx.glyph_run(&mut resources, &font)
+            .fill_glyphs(glyphs.into_iter());
+
+        assert!(resources.glyph_resources.is_none());
+
+        ctx.glyph_run(&mut resources, &font)
+            .atlas_cache(true)
+            .fill_glyphs(glyphs.into_iter());
+
+        assert!(resources.glyph_resources.is_some());
     }
 }

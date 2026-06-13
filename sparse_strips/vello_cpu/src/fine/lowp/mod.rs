@@ -8,14 +8,15 @@
 //! performance on many architectures compared to floating-point operations, while
 //! maintaining sufficient precision for most rendering tasks.
 
+pub(crate) mod blend;
 mod compose;
 mod gradient;
 mod image;
 
 use crate::filter::filter_lowp;
+use crate::fine::FineKernel;
 use crate::fine::lowp::image::{BilinearImagePainter, PlainBilinearImagePainter};
 use crate::fine::{COLOR_COMPONENTS, Painter, SCRATCH_BUF_SIZE, Splat4thExt};
-use crate::fine::{FineKernel, highp, u8_to_f32};
 use crate::layer_manager::LayerManager;
 use crate::peniko::BlendMode;
 use crate::region::Region;
@@ -32,7 +33,7 @@ use vello_common::mask::Mask;
 use vello_common::paint::{PremulColor, Tint, TintMode};
 use vello_common::pixmap::Pixmap;
 use vello_common::tile::Tile;
-use vello_common::util::{Div255Ext, f32_to_u8};
+use vello_common::util::Div255Ext;
 
 /// The kernel for doing rendering using u8/u16.
 #[derive(Clone, Copy, Debug)]
@@ -182,7 +183,7 @@ impl<S: Simd> FineKernel<S> for U8Kernel {
                         (simd.widen_u8x16(loaded) * simd.widen_u8x16(src.next().unwrap()))
                             .div_255(),
                     );
-                    el.copy_from_slice(mulled.as_slice());
+                    mulled.store_slice(el);
                 }
             },
         );
@@ -202,24 +203,27 @@ impl<S: Simd> FineKernel<S> for U8Kernel {
         let [r, g, b, a] = premul.components;
         let to_u8 = |v: f32| (v * 255.0 + 0.5) as u8;
         let color = u32::from_ne_bytes([to_u8(r), to_u8(g), to_u8(b), to_u8(a)]);
-        let tint_v = u32x8::block_splat(u32x4::splat(simd, color)).to_bytes();
 
         simd.vectorize(
             #[inline(always)]
-            || match tint.mode {
-                TintMode::AlphaMask => {
-                    for chunk in dest.chunks_exact_mut(32) {
-                        let pixel = u8x32::from_slice(simd, chunk);
-                        let alphas = pixel.splat_4th();
-                        let tinted = tint_v.normalized_mul(alphas);
-                        chunk.copy_from_slice(tinted.as_slice());
+            || {
+                let tint_v = u32x8::block_splat(u32x4::splat(simd, color)).to_bytes();
+
+                match tint.mode {
+                    TintMode::AlphaMask => {
+                        for chunk in dest.chunks_exact_mut(32) {
+                            let pixel = u8x32::from_slice(simd, chunk);
+                            let alphas = pixel.splat_4th();
+                            let tinted = tint_v.normalized_mul(alphas);
+                            tinted.store_slice(chunk);
+                        }
                     }
-                }
-                TintMode::Multiply => {
-                    for chunk in dest.chunks_exact_mut(32) {
-                        let pixel = u8x32::from_slice(simd, chunk);
-                        let tinted = pixel.normalized_mul(tint_v);
-                        chunk.copy_from_slice(tinted.as_slice());
+                    TintMode::Multiply => {
+                        for chunk in dest.chunks_exact_mut(32) {
+                            let pixel = u8x32::from_slice(simd, chunk);
+                            let tinted = pixel.normalized_mul(tint_v);
+                            tinted.store_slice(chunk);
+                        }
                     }
                 }
             },
@@ -350,8 +354,8 @@ mod fill {
     //! using only the source alpha channel for compositing.
 
     use crate::fine::Splat4thExt;
+    use crate::fine::lowp::blend;
     use crate::fine::lowp::compose::ComposeExt;
-    use crate::fine::lowp::mix;
     use crate::peniko::{BlendMode, Mix};
     use vello_common::fearless_simd::*;
     use vello_common::util::normalized_mul_u8x32;
@@ -372,10 +376,10 @@ mod fill {
                     let src_v = if default_mix {
                         next_src
                     } else {
-                        mix(next_src, bg_v, blend_mode)
+                        blend::mix(next_src, bg_v, blend_mode)
                     };
                     let res = blend_mode.compose(simd, src_v, bg_v, None);
-                    next_dest.copy_from_slice(res.as_slice());
+                    res.store_slice(next_dest);
                 }
             },
         );
@@ -399,7 +403,7 @@ mod fill {
                     let res_1 = alpha_composite_inner(s, bg_1, src_c, one_minus_alpha);
                     let res_2 = alpha_composite_inner(s, bg_2, src_c, one_minus_alpha);
                     let combined = s.combine_u8x32(res_1, res_2);
-                    next_dest.copy_from_slice(combined.as_slice());
+                    combined.store_slice(next_dest);
                 }
             },
         );
@@ -420,7 +424,7 @@ mod fill {
                     let one_minus_alpha = 255 - next_src.splat_4th();
                     let bg_v = u8x32::from_slice(simd, next_dest);
                     let res = alpha_composite_inner(simd, bg_v, next_src, one_minus_alpha);
-                    next_dest.copy_from_slice(res.as_slice());
+                    res.store_slice(next_dest);
                 }
             },
         );
@@ -449,7 +453,7 @@ mod alpha_fill {
 
     use crate::fine::Splat4thExt;
     use crate::fine::lowp::compose::ComposeExt;
-    use crate::fine::lowp::{extract_masks, mix};
+    use crate::fine::lowp::{blend, extract_masks};
     use crate::peniko::{BlendMode, Mix};
     use vello_common::fearless_simd::*;
     use vello_common::util::{Div255Ext, normalized_mul_u8x32};
@@ -474,12 +478,12 @@ mod alpha_fill {
                     let src_c = if default_mix {
                         next_src
                     } else {
-                        mix(next_src, bg_v, blend_mode)
+                        blend::mix(next_src, bg_v, blend_mode)
                     };
                     let masks = extract_masks(simd, &next_mask);
                     let res = blend_mode.compose(simd, src_c, bg_v, Some(masks));
 
-                    next_bg.copy_from_slice(res.as_slice());
+                    res.store_slice(next_bg);
                 }
             },
         );
@@ -559,42 +563,10 @@ mod alpha_fill {
                 let p2 = s.widen_u8x32(src_c) * s.widen_u8x32(mask_v);
                 let res = s.narrow_u16x32((p1 + p2).div_255());
 
-                dest.copy_from_slice(res.as_slice());
+                res.store_slice(dest);
             },
         );
     }
-}
-
-/// Applies blend mode mixing by converting to f32, mixing, then converting back to u8.
-///
-/// TODO: Add a proper lowp mix pipeline that operates entirely in integer space
-/// for better performance (currently converts through f32 which is slower).
-fn mix<S: Simd>(src_c: u8x32<S>, bg_c: u8x32<S>, blend_mode: BlendMode) -> u8x32<S> {
-    let to_f32 = |val: u8x32<S>| {
-        let (a, b) = src_c.simd.split_u8x32(val);
-        let mut a = u8_to_f32(a);
-        let mut b = u8_to_f32(b);
-        a *= f32x16::splat(src_c.simd, 1.0 / 255.0);
-        b *= f32x16::splat(src_c.simd, 1.0 / 255.0);
-        (a, b)
-    };
-
-    let to_u8 = |val1: f32x16<S>, val2: f32x16<S>| {
-        let val1 =
-            f32_to_u8(f32x16::splat(val1.simd, 255.0).mul_add(val1, f32x16::splat(val1.simd, 0.5)));
-        let val2 =
-            f32_to_u8(f32x16::splat(val2.simd, 255.0).mul_add(val2, f32x16::splat(val2.simd, 0.5)));
-
-        val1.simd.combine_u8x16(val1, val2)
-    };
-
-    let (mut src_1, mut src_2) = to_f32(src_c);
-    let (bg_1, bg_2) = to_f32(bg_c);
-
-    src_1 = highp::blend::mix(src_1, bg_1, blend_mode);
-    src_2 = highp::blend::mix(src_2, bg_2, blend_mode);
-
-    to_u8(src_1, src_2)
 }
 
 /// Expands 8 mask bytes into a 32-byte SIMD vector where each pixel's 4 components
@@ -679,10 +651,13 @@ fn pack_block<S: Simd>(simd: S, region: &mut Region<'_>, mut buf: &[u8]) {
         let casted: &[u32; 16] = cast_slice::<u8, u32>(col).try_into().unwrap();
 
         let loaded = simd.load_interleaved_128_u32x16(casted).to_bytes();
-        dest_slices[0][dest_idx..][..16].copy_from_slice(&loaded.as_slice()[..16]);
-        dest_slices[1][dest_idx..][..16].copy_from_slice(&loaded.as_slice()[16..32]);
-        dest_slices[2][dest_idx..][..16].copy_from_slice(&loaded.as_slice()[32..48]);
-        dest_slices[3][dest_idx..][..16].copy_from_slice(&loaded.as_slice()[48..64]);
+        let (loaded_lo, loaded_hi) = simd.split_u8x64(loaded);
+        let (loaded_1, loaded_2) = simd.split_u8x32(loaded_lo);
+        let (loaded_3, loaded_4) = simd.split_u8x32(loaded_hi);
+        loaded_1.store_slice(&mut dest_slices[0][dest_idx..][..16]);
+        loaded_2.store_slice(&mut dest_slices[1][dest_idx..][..16]);
+        loaded_3.store_slice(&mut dest_slices[2][dest_idx..][..16]);
+        loaded_4.store_slice(&mut dest_slices[3][dest_idx..][..16]);
     }
 }
 

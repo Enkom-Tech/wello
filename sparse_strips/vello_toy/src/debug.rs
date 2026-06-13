@@ -18,6 +18,7 @@ use vello_common::coarse::{Cmd, MODE_CPU, Wide, WideTile};
 use vello_common::color::palette::css::BLACK;
 use vello_common::fearless_simd::Level;
 use vello_common::flatten::{FlattenCtx, Line};
+use vello_common::geometry::RectU16;
 use vello_common::kurbo::{Affine, BezPath, Cap, Join, Stroke, StrokeCtx};
 use vello_common::peniko::Fill;
 use vello_common::strip::Strip;
@@ -32,7 +33,7 @@ fn main() {
         Document::new().set("viewBox", (-10, -10, args.width + 20, args.height + 20));
 
     let mut line_buf = vec![];
-    let mut tiles = Tiles::new(Level::new());
+    let mut tiles = Tiles::new(Level::new(), args.height);
     let mut strip_buf = vec![];
     let mut alpha_buf = vec![];
     let mut wide = Wide::<MODE_CPU>::new(args.width, args.height);
@@ -49,7 +50,7 @@ fn main() {
                 Affine::IDENTITY,
                 &mut line_buf,
                 &mut FlattenCtx::default(),
-                [0, 0, args.width, args.height],
+                RectU16::new(0, 0, args.width, args.height),
             );
         } else {
             let stroke = Stroke {
@@ -67,13 +68,13 @@ fn main() {
                 &mut line_buf,
                 &mut FlattenCtx::default(),
                 &mut StrokeCtx::default(),
-                [0, 0, args.width, args.height],
+                RectU16::new(0, 0, args.width, args.height),
             );
         }
     }
 
     if stages.iter().any(|s| s.requires_tiling()) {
-        tiles.make_tiles_analytic_aa(&line_buf, args.width, args.height);
+        tiles.make_tiles_analytic_aa(Level::new(), &line_buf, args.width, args.height);
         tiles.sort_tiles();
     }
 
