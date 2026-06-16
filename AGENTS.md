@@ -32,11 +32,15 @@ akira-board who                  # other agents' declared areas + files they've 
 If another agent's area/files overlap yours, coordinate or pick a different area. If they don't
 overlap, just proceed — parallel work in separate areas is expected.
 
-If a card matches what you're about to do, announce you're picking it up:
+If a card matches what you're about to do, claim it — pass your session id so it links to you
+(then `sync`/`who` show others that you're on it, in the `active` column):
 
 ```powershell
-akira-board start <card-id> -Agent "<tool>:host"
+akira-board start <card-id> -Session <id>
 ```
+
+`akira-board sync` marks any card already being worked by a live agent in its `active` column —
+**don't pick up a card that already shows an owner there** unless you're collaborating.
 
 ## While working
 Post progress so other agents (and the dashboard) see it:
