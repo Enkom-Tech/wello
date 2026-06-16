@@ -110,42 +110,47 @@ function Emit([string]$rel, [string]$content) {
 $lockEntries = @()
 foreach ($rel in $outputs.Keys) { $lockEntries += Emit $rel $outputs[$rel] }
 
-# --- merge the Claude SessionStart hook into settings.json (preserve everything else) -----
-# Not checksummed (user may have other settings) — we only ever own the one marked hook.
+# --- merge our managed Claude hooks (board-hook) into settings.json (preserve everything else) ---
+# Three events: SessionStart (sync + presence register), PostToolUse (presence heartbeat + file
+# touched), Stop (clear presence). Adaptive command: repo-relative if this repo ships
+# board-hook.ps1, else the `akira-board-hook` PATH shim. Not checksummed (repo may add hooks).
 $settingsRel = ".claude/settings.json"
 $settingsAbs = Join-Path $repoRoot ".claude\settings.json"
-# Adaptive: if this repo ships the wrapper, call it repo-relative (self-contained, no PATH dep).
-# Otherwise rely on the `akira-board` PATH shim (install-akira-board.ps1).
-$localWrapper = Join-Path $repoRoot "scripts\agents\akira-board.ps1"
-$hookCmd = if (Test-Path $localWrapper) {
-  "pwsh -NoProfile -File `"`$CLAUDE_PROJECT_DIR/scripts/agents/akira-board.ps1`" sync"
-} else {
-  "akira-board sync"
+$localHook = Join-Path $repoRoot "scripts\agents\board-hook.ps1"
+function HookCmd([string]$e) {
+  if (Test-Path $localHook) { "pwsh -NoProfile -File `"`$CLAUDE_PROJECT_DIR/scripts/agents/board-hook.ps1`" -Event $e" }
+  else { "akira-board-hook $e" }
 }
-$managedGroup = @{ hooks = @(@{ type = "command"; command = $hookCmd }) }
+$managed = [ordered]@{
+  SessionStart = @{ hooks = @(@{ type='command'; command=(HookCmd 'SessionStart') }) }
+  PostToolUse  = @{ matcher='Edit|Write|MultiEdit|NotebookEdit'; hooks = @(@{ type='command'; command=(HookCmd 'PostToolUse') }) }
+  Stop         = @{ hooks = @(@{ type='command'; command=(HookCmd 'Stop') }) }
+}
+$ownRe  = 'board-hook'              # commands we currently own
+$dropRe  = 'board-hook|akira-board' # on regen, drop ours + any legacy `akira-board sync` hook
 
 if ($Check) {
-  $ok = $false
-  if (Test-Path $settingsAbs) {
-    $j = Get-Content -Raw $settingsAbs | ConvertFrom-Json
-    $ss = $j.hooks.SessionStart
-    if ($ss) { $ok = @($ss | Where-Object { ($_.hooks | Where-Object { $_.command -like "*$marker*" }) }).Count -gt 0 }
+  $present = $true
+  $j = if (Test-Path $settingsAbs) { Get-Content -Raw $settingsAbs | ConvertFrom-Json } else { $null }
+  foreach ($evt in $managed.Keys) {
+    $groups = if ($j) { $j.hooks.$evt } else { $null }
+    $has = $groups -and (@($groups | Where-Object { $_.hooks | Where-Object { $_.command -match $ownRe } }).Count -gt 0)
+    if (-not $has) { $present = $false }
   }
-  if (-not $ok) { $drift += "$settingsRel (SessionStart hook missing)" }
+  if (-not $present) { $drift += "$settingsRel (board hooks missing/stale)" }
 } else {
   $settings = if (Test-Path $settingsAbs) { Get-Content -Raw $settingsAbs | ConvertFrom-Json } else { [pscustomobject]@{} }
   $s = ToHt $settings
   if (-not $s.ContainsKey('hooks')) { $s['hooks'] = @{} }
-  if (-not $s['hooks'].ContainsKey('SessionStart')) { $s['hooks']['SessionStart'] = @() }
-  # Drop any prior managed group, keep the rest, append ours.
-  $kept = @($s['hooks']['SessionStart'] | Where-Object {
-    -not ($_.hooks | Where-Object { $_.command -like "*$marker*" })
-  })
-  $s['hooks']['SessionStart'] = @($kept + $managedGroup)
+  foreach ($evt in $managed.Keys) {
+    if (-not $s['hooks'].ContainsKey($evt)) { $s['hooks'][$evt] = @() }
+    $kept = @($s['hooks'][$evt] | Where-Object { -not ($_.hooks | Where-Object { $_.command -match $dropRe }) })
+    $s['hooks'][$evt] = @($kept + $managed[$evt])
+  }
   $dir = Split-Path -Parent $settingsAbs
   if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
   ($s | ConvertTo-Json -Depth 12) | Set-Content -Path $settingsAbs -Encoding UTF8
-  Write-Host "  merged SessionStart hook -> $settingsRel" -ForegroundColor DarkGray
+  Write-Host "  merged board hooks (SessionStart/PostToolUse/Stop) -> $settingsRel" -ForegroundColor DarkGray
 }
 
 # --- mount the Hermes Kanban MCP server (kanban_* tools) into Claude + Cursor --------------

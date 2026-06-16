@@ -1,17 +1,17 @@
 {
+  "generatedFrom": "repo:wello",
   "files": [
     {
-      "sha": "4ec50d1a9f475a432b3b3ec51e86b0a3039ed68762d5de6fec1687e4c0659a8f",
+      "sha": "ab282e87d5463ff15054511bac42a620550250ace773b169d6fdf1f7fea5e673",
       "path": "AGENTS.md"
     },
     {
-      "sha": "a097d75e86fe71acbd8d3b540deb695d3bb864e85b613f26fe30cdc2af5a0792",
+      "sha": "9f6546405f035090be6c375fbcd94f0ebef4ae484d6b308742ac6e82bb3453bf",
       "path": ".cursor/rules/00-akira-agents.mdc"
     },
     {
-      "sha": "ab6eda17a44a67d8abc0f2ed8f5ea411c436cefde8a09ce063b758d8c33b5251",
+      "sha": "9cec7e371f194929e61e038ed4786fd501dc331fec71be82b15bf53c3d37d01e",
       "path": ".claude/CLAUDE.agents.md"
     }
-  ],
-  "generatedFrom": "repo:wello"
+  ]
 }

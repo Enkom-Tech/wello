@@ -4,7 +4,28 @@
       {
         "hooks": [
           {
-            "command": "akira-board sync",
+            "command": "akira-board-hook SessionStart",
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "command": "akira-board-hook Stop",
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "command": "akira-board-hook PostToolUse",
             "type": "command"
           }
         ]
