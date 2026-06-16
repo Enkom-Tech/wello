@@ -13,10 +13,10 @@ akira-board sync
 ```
 
 **Declare your area** so other agents can work this repo in parallel without colliding — use the
-session id the hook printed:
+session id the hook printed. Optionally reserve the files/globs you intend to own:
 
 ```powershell
-akira-board working "<what you're focusing on, e.g. BLE transport refactor>" -Session <id>
+akira-board working "<focus, e.g. BLE transport refactor>" -Session <id> -Files src/ble/*,src/transport.zig
 ```
 
 Multiple agents in one repo is fine **as long as you're in different areas**. Before starting,
@@ -63,3 +63,13 @@ It lists other live host agents (with the files they've recently edited) and liv
 (with their cards). If one overlaps your work, **coordinate before fighting it**: comment on its
 card (`akira-board note <id> "..."`), pause, or pick a different task. Don't both edit the same
 files blind. Your own presence (and the files you edit) is posted automatically via session hooks.
+
+**A file changed and you didn't change it?** Don't investigate from scratch — ask who did:
+
+```powershell
+akira-board blame path/to/file      # "agent Y (focus: ...) edited this 2m ago"
+```
+
+If `blame` names another agent, that change is theirs, not stray corruption — don't try to "fix"
+or revert it. You'll also get an **automatic warning** before you edit a file another live agent
+is working in (injected by a PreToolUse hook) — heed it.

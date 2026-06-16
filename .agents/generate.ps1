@@ -123,6 +123,7 @@ function HookCmd([string]$e) {
 }
 $managed = [ordered]@{
   SessionStart = @{ hooks = @(@{ type='command'; command=(HookCmd 'SessionStart') }) }
+  PreToolUse   = @{ matcher='Edit|Write|MultiEdit|NotebookEdit'; hooks = @(@{ type='command'; command=(HookCmd 'PreToolUse') }) }
   PostToolUse  = @{ matcher='Edit|Write|MultiEdit|NotebookEdit'; hooks = @(@{ type='command'; command=(HookCmd 'PostToolUse') }) }
   Stop         = @{ hooks = @(@{ type='command'; command=(HookCmd 'Stop') }) }
 }
