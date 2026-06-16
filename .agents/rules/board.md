@@ -5,11 +5,29 @@ only — never open `data/hermes/**/kanban.db` directly** (concurrent SQLite wri
 If `akira-board` isn't on PATH, run the akira repo's `scripts/agents/install-akira-board.ps1` once.
 
 ## When you start working in this repo
-Run this first to see the cards that concern this repo:
+The SessionStart hook auto-runs `sync` and prints your **board session id** plus any other
+agents already active here. To see the cards yourself:
 
 ```powershell
 akira-board sync
 ```
+
+**Declare your area** so other agents can work this repo in parallel without colliding — use the
+session id the hook printed:
+
+```powershell
+akira-board working "<what you're focusing on, e.g. BLE transport refactor>" -Session <id>
+```
+
+Multiple agents in one repo is fine **as long as you're in different areas**. Before starting,
+check who else is here and what they're touching:
+
+```powershell
+akira-board who                  # other agents' declared areas + files they've edited
+```
+
+If another agent's area/files overlap yours, coordinate or pick a different area. If they don't
+overlap, just proceed — parallel work in separate areas is expected.
 
 If a card matches what you're about to do, announce you're picking it up:
 
