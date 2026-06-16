@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "command": "akira-board sync",
+            "type": "command"
+          }
+        ]
+      }
+    ]
+  }
+}

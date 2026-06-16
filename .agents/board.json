@@ -1,0 +1,5 @@
+{
+  "repo": "wello",
+  "$comment": "This repo's identity for the shared Akira Kanban. repo MUST be a canonical slug from config/agents/repos.json.",
+  "privacy": "open"
+}
