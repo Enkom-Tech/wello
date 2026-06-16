@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "hermes-board": {
-      "args": [],
-      "command": "akira-mcp-board"
+      "command": "akira-mcp-board",
+      "args": []
     }
   }
 }
