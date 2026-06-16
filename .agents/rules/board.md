@@ -4,6 +4,12 @@ There is a shared Akira Kanban board. **Read and update it through the `akira-bo
 only — never open `data/hermes/**/kanban.db` directly** (concurrent SQLite writers corrupt it).
 If `akira-board` isn't on PATH, run the akira repo's `scripts/agents/install-akira-board.ps1` once.
 
+> These board rules are the **repo-agnostic baseline** shared by every Akira repo (generated from
+> the `.agents/` source of truth). **New repo?** Wire it with the akira repo's
+> `scripts/agents/init-agents.ps1 -RepoPath <dir> -Slug <slug>` (add the slug to
+> `config/agents/repos.json` first); `scripts/agents/sync-agents.ps1` re-syncs every repo and
+> auto-wires any that are missing `.agents/`.
+
 ## When you start working in this repo
 The SessionStart hook auto-runs `sync` and prints your **board session id** plus any other
 agents already active here. To see the cards yourself:

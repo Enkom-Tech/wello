@@ -80,12 +80,18 @@ alwaysApply: true
 $rulesBody
 "@
 
-$outputs[".claude/CLAUDE.agents.md"] = Norm @"
+# Claude Code auto-loads `.claude/rules/**/*.md` (NOT AGENTS.md, NOT .claude/CLAUDE.agents.md).
+# So the board rules MUST live here to actually reach a Claude session.
+$outputs[".claude/rules/akira-agents.md"] = Norm @"
 <!-- $WARN -->
 # Agent rules (repo: $repoSlug)
 
 $rulesBody
 "@
+
+# Retire the old non-loaded file if a prior generation left it behind.
+$staleClaudeAgents = Join-Path $repoRoot ".claude\CLAUDE.agents.md"
+if (-not $Check -and (Test-Path $staleClaudeAgents)) { Remove-Item $staleClaudeAgents -Force -ErrorAction SilentlyContinue }
 
 # --- write / check helpers ---------------------------------------------------------------
 $lock = if ((Test-Path $lockPath) -and -not $Check) { Get-Content -Raw $lockPath | ConvertFrom-Json } else { $null }
