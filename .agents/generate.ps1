@@ -51,6 +51,14 @@ function Sha([string]$text) {
 }
 # Normalize to LF so checksums are stable regardless of how git/editors handle EOL.
 function Norm([string]$s) { ($s -replace "`r`n","`n").TrimEnd() + "`n" }
+# PSCustomObject (from ConvertFrom-Json) -> mutable hashtable tree, for safe JSON merging.
+function ToHt($o) {
+  if ($o -is [System.Management.Automation.PSCustomObject]) {
+    $h = @{}; foreach ($p in $o.PSObject.Properties) { $h[$p.Name] = ToHt $p.Value }; return $h
+  } elseif ($o -is [System.Collections.IEnumerable] -and $o -isnot [string]) {
+    return @($o | ForEach-Object { ToHt $_ })
+  } else { return $o }
+}
 
 # --- build outputs (content keyed by repo-relative path) ---------------------------------
 $outputs = [ordered]@{}
@@ -126,14 +134,6 @@ if ($Check) {
   if (-not $ok) { $drift += "$settingsRel (SessionStart hook missing)" }
 } else {
   $settings = if (Test-Path $settingsAbs) { Get-Content -Raw $settingsAbs | ConvertFrom-Json } else { [pscustomobject]@{} }
-  # Convert to a mutable hashtable tree for safe editing.
-  function ToHt($o) {
-    if ($o -is [System.Management.Automation.PSCustomObject]) {
-      $h = @{}; foreach ($p in $o.PSObject.Properties) { $h[$p.Name] = ToHt $p.Value }; return $h
-    } elseif ($o -is [System.Collections.IEnumerable] -and $o -isnot [string]) {
-      return @($o | ForEach-Object { ToHt $_ })
-    } else { return $o }
-  }
   $s = ToHt $settings
   if (-not $s.ContainsKey('hooks')) { $s['hooks'] = @{} }
   if (-not $s['hooks'].ContainsKey('SessionStart')) { $s['hooks']['SessionStart'] = @() }
@@ -146,6 +146,33 @@ if ($Check) {
   if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
   ($s | ConvertTo-Json -Depth 12) | Set-Content -Path $settingsAbs -Encoding UTF8
   Write-Host "  merged SessionStart hook -> $settingsRel" -ForegroundColor DarkGray
+}
+
+# --- mount the Hermes Kanban MCP server (kanban_* tools) into Claude + Cursor --------------
+# Merge-aware (preserve other servers). Command = the `akira-mcp-board` PATH shim, so no akira
+# path or secret lands in the committed repo config. Not checksummed (repo may add servers).
+$mcpName = "hermes-board"
+$mcpEntry = @{ command = "akira-mcp-board"; args = @() }
+$mcpTargets = [ordered]@{
+  ".mcp.json"        = (Join-Path $repoRoot ".mcp.json")
+  ".cursor/mcp.json" = (Join-Path $repoRoot ".cursor\mcp.json")
+}
+foreach ($rel in $mcpTargets.Keys) {
+  $abs = $mcpTargets[$rel]
+  if ($Check) {
+    $present = $false
+    if (Test-Path $abs) { try { $present = $null -ne (Get-Content -Raw $abs | ConvertFrom-Json).mcpServers.$mcpName } catch {} }
+    if (-not $present) { $drift += "$rel ($mcpName MCP server missing)" }
+  } else {
+    $j = if (Test-Path $abs) { Get-Content -Raw $abs | ConvertFrom-Json } else { [pscustomobject]@{} }
+    $m = ToHt $j
+    if (-not $m.ContainsKey('mcpServers')) { $m['mcpServers'] = @{} }
+    $m['mcpServers'][$mcpName] = $mcpEntry
+    $dir = Split-Path -Parent $abs
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+    ($m | ConvertTo-Json -Depth 12) | Set-Content -Path $abs -Encoding UTF8
+    Write-Host "  mounted MCP server -> $rel" -ForegroundColor DarkGray
+  }
 }
 
 # --- lock / report -----------------------------------------------------------------------
