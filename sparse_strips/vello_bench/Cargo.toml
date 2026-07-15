@@ -15,13 +15,8 @@ vello_cpu = { workspace = true }
 vello_dev_macros = { workspace = true }
 criterion = { workspace = true }
 image = { workspace = true, features = ["jpeg"] }
-<<<<<<< HEAD
-parley = { version = "0.9.0", default-features = true }
-rand = { workspace = true }
-=======
 parley = { version = "0.11.0", default-features = true }
 rand = { workspace = true, features = ["small_rng"] }
->>>>>>> upstream/main
 smallvec = { workspace = true }
 usvg = { workspace = true }
 
