@@ -108,6 +108,8 @@
 
 #[cfg(feature = "wgpu")]
 pub mod blur;
+#[cfg(feature = "wgpu")]
+pub mod color_matrix;
 mod debug;
 mod recording;
 mod render;
