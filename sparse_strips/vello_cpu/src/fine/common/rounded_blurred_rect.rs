@@ -19,6 +19,7 @@ pub(crate) struct BlurredRoundedRectFiller<S: Simd> {
     g: f32x8<S>,
     b: f32x8<S>,
     a: f32x8<S>,
+    invert: bool,
     alpha_calculator: AlphaCalculator<S>,
 }
 
@@ -53,6 +54,7 @@ impl<S: Simd> BlurredRoundedRectFiller<S> {
                     g,
                     b,
                     a,
+                    invert: rect.invert,
                 }
             },
         )
@@ -64,7 +66,10 @@ impl<S: Simd> Iterator for BlurredRoundedRectFiller<S> {
 
     #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
-        let next = self.alpha_calculator.next().unwrap();
+        let mut next = self.alpha_calculator.next().unwrap();
+        if self.invert {
+            next = f32x8::splat(next.simd, 1.0) - next;
+        }
         let r = self.r * next;
         let g = self.g * next;
         let b = self.b * next;
@@ -75,7 +80,7 @@ impl<S: Simd> Iterator for BlurredRoundedRectFiller<S> {
 }
 
 impl<S: Simd> crate::fine::Painter for BlurredRoundedRectFiller<S> {
-    fn paint_u8(&mut self, buf: &mut [u8]) {
+    fn paint_u8(mut self, buf: &mut [u8]) {
         self.a.simd.vectorize(
             #[inline(always)]
             || {
@@ -101,7 +106,7 @@ impl<S: Simd> crate::fine::Painter for BlurredRoundedRectFiller<S> {
         );
     }
 
-    fn paint_f32(&mut self, buf: &mut [f32]) {
+    fn paint_f32(mut self, buf: &mut [f32]) {
         self.a.simd.vectorize(
             #[inline(always)]
             || {

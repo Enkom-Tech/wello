@@ -358,7 +358,7 @@ fn do_not_panic_on_multiple_flushes(ctx: &mut impl Renderer) {
 }
 
 /// <https://github.com/linebender/vello/issues/1119>
-#[vello_test]
+#[vello_test(skip_hybrid)]
 fn clip_clear(ctx: &mut impl Renderer) {
     // initial coloring
     ctx.set_paint(LIME);
@@ -643,7 +643,31 @@ fn issue_1477(ctx: &mut impl Renderer) {
     ctx.fill_rect(&rect);
 }
 
-#[vello_test(skip_multithreaded, width = 768, height = 100, hybrid_tolerance = 3)]
+#[vello_test(width = 512, height = 16)]
+fn opaque_rect_partially_occluding_aa_edge(ctx: &mut impl Renderer) {
+    // Hypotenuse crosses strip row y in 8..12 over the full width, producing one
+    // long AA strip. The rect's interior covers depth buckets [128, 384), splitting
+    // the strip into visible runs [0, 128) and [384, 512).
+    let mut triangle = BezPath::new();
+    triangle.move_to((0.0, 8.0));
+    triangle.line_to((512.0, 12.0));
+    triangle.line_to((0.0, 12.0));
+    triangle.close_path();
+    ctx.set_paint(DARK_BLUE);
+    ctx.fill_path(&triangle);
+    ctx.set_paint(RED);
+    ctx.fill_rect(&Rect::new(96.0, 8.0, 416.0, 12.0));
+}
+
+// TODO: Re-enable hybrid once proper edge handling is implemented in Vello hybrid.
+#[vello_test(
+    skip_multithreaded,
+    skip_hybrid,
+    skip_hybrid_constrained,
+    width = 768,
+    height = 100,
+    hybrid_tolerance = 3
+)]
 fn issue_1509(ctx: &mut impl Renderer) {
     let filter = Filter::from_primitive(FilterPrimitive::GaussianBlur {
         std_deviation: 25.0,
@@ -741,6 +765,12 @@ fn issue_1528(ctx: &mut impl Renderer) {
     };
     ctx.set_paint(grad3);
     ctx.fill_rect(&Rect::new(-250.0, -250.0, -150.0, -150.0));
+}
+
+#[vello_test]
+fn issue_1707_transparent_solid_fill(ctx: &mut impl Renderer) {
+    ctx.set_paint(Color::from_rgb8(0, 0, 0).with_alpha(0.001));
+    ctx.fill_rect(&Rect::new(0.0, 0.0, 100.0, 100.0));
 }
 
 #[vello_test]

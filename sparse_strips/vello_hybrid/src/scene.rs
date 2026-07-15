@@ -168,10 +168,10 @@ impl SceneConstraints {
 pub struct RenderSettings {
     /// The SIMD level that should be used for rendering operations.
     pub level: Level,
-    /// The configuration for the texture atlas.
+    /// The configuration for the image/glyph texture atlas.
     ///
-    /// This controls how images are managed in GPU memory through texture atlases.
-    /// The atlas system packs multiple images into larger textures to reduce the
+    /// This controls how uploaded images and glyphs are managed in GPU memory through texture
+    /// atlases. The atlas system packs multiple images into larger textures to reduce the
     /// number of GPU texture bindings. This config allows customizing atlas parameters such as:
     /// - The number and size of atlases
     /// - How images are allocated across multiple atlases
@@ -179,7 +179,12 @@ pub struct RenderSettings {
     ///
     /// Adjusting these settings can affect memory usage and rendering performance
     /// depending on your application's image usage patterns.
-    pub atlas_config: AtlasConfig,
+    pub image_atlas_config: AtlasConfig,
+    /// The configuration for the filter scratch texture atlas.
+    ///
+    /// Filters (e.g. blurs) render intermediate results into their own set of scratch atlas
+    /// textures, separate from the image/glyph atlas.
+    pub filter_atlas_config: AtlasConfig,
     /// Constraints on the scene that the renderer can exploit for optimisation.
     pub constraints: SceneConstraints,
 }
@@ -188,7 +193,13 @@ impl Default for RenderSettings {
     fn default() -> Self {
         Self {
             level: Level::try_detect().unwrap_or(Level::baseline()),
-            atlas_config: AtlasConfig::default(),
+            image_atlas_config: AtlasConfig::default(),
+            filter_atlas_config: AtlasConfig {
+                // Filter scratch textures are only needed when a scene actually uses filters,
+                // so start with none and let `auto_grow` allocate them on demand.
+                initial_atlas_count: 0,
+                ..AtlasConfig::default()
+            },
             constraints: SceneConstraints::new(),
         }
     }
@@ -433,7 +444,7 @@ impl Scene {
     /// example for how this method differs from `push_clip_layer`.
     pub fn push_clip_path(&mut self, path: &BezPath) {
         self.clip_context.push_clip(
-            path,
+            path.iter(),
             &mut self.strip_generator,
             self.render_state.fill_rule,
             self.render_state.transform,
@@ -740,9 +751,19 @@ impl Scene {
 
     /// Fill a blurred rectangle with the given corner radius and standard deviation.
     ///
+    /// When `invert` is `true`, the inverse (`1 - alpha`) of the blur coverage is painted: the
+    /// paint is fully opaque outside the blurred rectangle and fades to transparent inside it. This
+    /// can be used to implement inset box shadows.
+    ///
     /// This operation uses the current transform and paint transform. Like Vello CPU, it only
     /// uses solid paints; non-solid paints fall back to black.
-    pub fn fill_blurred_rounded_rect(&mut self, rect: &Rect, radius: f32, std_dev: f32) {
+    pub fn fill_blurred_rounded_rect(
+        &mut self,
+        rect: &Rect,
+        radius: f32,
+        std_dev: f32,
+        invert: bool,
+    ) {
         if !self.paint_visible {
             return;
         }
@@ -758,6 +779,7 @@ impl Scene {
                 color,
                 radius,
                 std_dev,
+                invert,
             };
 
             let kernel_size = 2.5 * std_dev;
@@ -1085,7 +1107,7 @@ impl Scene {
     /// Reset scene to default values.
     pub fn reset(&mut self) {
         self.wide.reset();
-        self.strip_generator.reset();
+        self.strip_generator.reset(self.width, self.height);
         self.clip_context.reset();
         // Set the strip storage back to `Append` mode since the fast path is re-enabled on reset.
         {

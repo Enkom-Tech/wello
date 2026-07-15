@@ -38,15 +38,9 @@ fn base<S: Simd, N: FineKernel<S>>(b: &mut Bencher<'_>, fine: &mut Fine<S, N>, t
         color: GREEN,
         radius: 30.0,
         std_dev: 10.0,
+        invert: false,
     };
 
     let paint = rect.encode_into(&mut paints, transform, None);
-    fill_single(
-        &paint,
-        &paints,
-        WideTile::WIDTH as usize,
-        b,
-        default_blend(),
-        fine,
-    );
+    fill_single(&paint, &paints, WideTile::WIDTH, b, default_blend(), fine);
 }

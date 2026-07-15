@@ -8,6 +8,7 @@ pub mod blurred_rounded_rect;
 pub mod clip;
 pub mod emoji_grid;
 pub mod filter;
+pub mod filter_blur_circle;
 pub mod filter_elements;
 pub mod gradient;
 pub mod image;
@@ -174,7 +175,7 @@ impl RenderingContext for RenderContext {
     }
 
     fn fill_blurred_rounded_rect(&mut self, rect: &Rect, radius: f32, std_dev: f32) {
-        self.fill_blurred_rounded_rect(rect, radius, std_dev);
+        self.fill_blurred_rounded_rect(rect, radius, std_dev, false);
     }
 
     fn glyph_run<'a>(
@@ -279,7 +280,7 @@ impl RenderingContext for Scene {
     }
 
     fn fill_blurred_rounded_rect(&mut self, rect: &Rect, radius: f32, std_dev: f32) {
-        self.fill_blurred_rounded_rect(rect, radius, std_dev);
+        self.fill_blurred_rounded_rect(rect, radius, std_dev, false);
     }
 
     fn glyph_run<'a>(
@@ -502,6 +503,9 @@ where
         flower_source,
     )));
     scenes.push(AnyScene::new(filter_elements::FilterElementsScene::new()));
+    scenes.push(AnyScene::new(
+        filter_blur_circle::FilterBlurCircleScene::new(),
+    ));
     scenes.push(AnyScene::new(gradient::GradientExtendScene::new()));
     scenes.push(AnyScene::new(gradient::RadialScene::new()));
     scenes.push(AnyScene::new(path::FillTypesScene::new()));
@@ -541,6 +545,7 @@ where
         AnyScene::new(image::ImageScene::new(img_sources.clone())),
         AnyScene::new(multi_image::MultiImageScene::new(img_sources[0].clone())),
         AnyScene::new(filter_elements::FilterElementsScene::new()),
+        AnyScene::new(filter_blur_circle::FilterBlurCircleScene::new()),
         AnyScene::new(gradient::GradientExtendScene::new()),
         AnyScene::new(gradient::RadialScene::new()),
         AnyScene::new(path::FillTypesScene::new()),
