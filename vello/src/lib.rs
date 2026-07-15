@@ -106,6 +106,8 @@
     reason = "Deferred, only apply in some feature sets so not expect"
 )]
 
+#[cfg(feature = "wgpu")]
+pub mod blur;
 mod debug;
 mod recording;
 mod render;

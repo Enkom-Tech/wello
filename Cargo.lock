@@ -4068,6 +4068,7 @@ dependencies = [
  "log",
  "peniko",
  "png",
+ "pollster",
  "skrifa",
  "static_assertions",
  "thiserror 2.0.18",
