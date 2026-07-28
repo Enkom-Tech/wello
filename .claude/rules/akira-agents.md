@@ -45,6 +45,14 @@ If a card matches what you're about to do, claim it — pass your session id so 
 akira-board start <card-id> -Session <id>
 ```
 
+On `start`, the board auto-assembles a **context pack** for that card and prints it: the card + its
+parents' results, the nearest memory/code/experience (semantic retrieval), and any active model-bus
+health warnings — a just-enough brief so you begin informed instead of re-discovering what's known. It's
+best-effort (skipped if the model bus is down); disable with `AKIRA_CONTEXT_PACK=0`. You can also pull one
+on demand: `python tools/agents/context_pack.py --card <id>` or `--focus "<text>" --files <globs>`.
+Dispatched Hermes **workers** get the same brief as a one-time card comment when the operator enables
+`AKIRA_WORKER_CONTEXT_PACK=1` (posted by the host presence poller; off by default).
+
 `akira-board sync` marks any card already being worked by a live agent in its `active` column —
 **don't pick up a card that already shows an owner there** unless you're collaborating.
 
@@ -61,6 +69,100 @@ akira-board done <card-id> -Summary "outcome; tests status"
 ```
 
 If you're blocked: `akira-board block <card-id> -Reason "..."`. New work with no card: `akira-board create "<title>" -Body '<route block>'`.
+
+## Finish clean — commit your work, don't leave branches/worktrees hanging
+**Once your work is green, commit it before you end the session.** Green means you actually ran
+the relevant tests/build and checked for regressions — not "it looks right".
+
+Every abandoned uncommitted diff becomes someone else's problem: the next agent finds a dirty tree
+it didn't create, can't tell finished work from a half-edit, and burns a chunk of its session
+working that out (see `blame`'s live-vs-historical distinction above — that ambiguity is exactly
+what this rule exists to prevent). A stale worktree also silently pins branches and disk.
+
+So, before you finish:
+
+```powershell
+git status --short                  # nothing unexpected left behind?
+git worktree list                   # every worktree YOU created still here?
+```
+
+- **Commit what's green.** A focused commit with a real message beats leaving it uncommitted "for
+  the operator to look at" — the diff is in history either way, and committed work is reviewable
+  and revertable. If you're on the default branch, branch first.
+- **Remove worktrees you created** (`git worktree remove <path>`) and delete branches you merged
+  or abandoned. Don't remove worktrees or branches you didn't create — they may be another live
+  agent's (`akira-board who`).
+- **Not green?** Don't leave it silently. Either revert your changes, or commit them on a clearly
+  named branch AND say so on the card (`akira-board note <id> "..."` / the `done`/`block` summary)
+  so the next agent isn't guessing. Silence is the failure mode, not an unfinished branch.
+- **Never commit secrets** — `.env`, identity/key files, tokens. Check the diff, not just the paths.
+- **Don't push** unless the operator asked; committing locally is what this rule requires.
+
+## Asking the operator (human-in-the-loop)
+When you hit a decision **only the human operator can make** — a judgment call, a missing secret, an
+irreversible/production/sensitive-IP action, an ambiguous requirement — **don't guess and don't silently
+stall. Ask.** One command pings the operator on their phone (Telegram push, with a toast/log fallback so
+it's never lost) and blocks the card until they answer:
+
+```powershell
+akira-board ask <card-id> "use gip-vault or env for inc3's secret? || gip-vault || env"
+akira-board ask "should we ship inc3 without the M1 runbook?"   # no card -> creates one to carry it
+```
+
+- This works from **any repo** — host Claude/Cursor sessions and Hermes workers alike. The operator can
+  be AFK; they answer whenever they remote in.
+- Keep it to **one crisp question**. Text after `||` becomes tappable choice buttons on their phone.
+- Their reply posts an `@operator: <answer>` comment and unblocks the card. Read it with
+  `akira-board show <card-id>` (or a fresh worker resumes with the answer already in context).
+- Prefer `ask` over blocking-and-hoping: a bare `block` won't notify anyone. (Under the hood `ask`
+  just drops an `@human:` comment — the marker the escalation bridge watches — then blocks; the verb
+  is the discoverable, foolproof way to do it.)
+
+## Creating cards — quirks that bite
+- **Multi-line body:** never pass a here-string as `-Body` through the `akira-board` PATH shim — it routes through cmd.exe, which truncates the argument at its first newline (the body is silently lost after line 1). Carry the content out-of-band with `-BodyFile`, which survives every transport (shim included): `akira-board create "<title>" -BodyFile card.md -IdempotencyKey "<key>"`, or from stdin `Get-Content card.md -Raw | akira-board create "<title>" -BodyFile -`. `-SummaryFile`/`-ReasonFile` do the same for `done`/`block`. (Calling the `.ps1` directly with a here-string also works, but `-BodyFile` is the portable way.)
+- **Repo routing:** put a route block at the top of the body — `route:` / `  repo: <slug>` / `  kind: task` / `---` / `<content>`. A truncated route block is now *rejected* with a clear error rather than silently stored malformed.
+- **Omit `-Priority`** — passing it returns HTTP 400 (priority stored as 0 regardless); still unfixed.
+- `-Goal` marks a card as a goal (use for epics); idempotency keys make re-runs safe.
+- `akira-board show <id>` (human format) can throw a `ContainsKey null` formatter error → use `show <id> -Json`.
+- The bridge `health` verb reports "up" even when the backing **Docker** board container is down — in that state every read/write returns 502. Confirm with a real `list`, not `health`.
+
+## Epic cards + goal-mode dispatch hazard
+The dispatcher auto-assigns cards via `kanban.default_assignee` to the goal-mode `coder` worker. A
+card that is `kind: epic` (a tracker with child leaves) **plus** `goal_mode: true` gives the coder no
+leaf to complete, so it **loops indefinitely** — wanders/crashes/re-dispatches, and after quota runs
+out can fall back to paid inference, burning tokens for days. Such epics show up as phantom "active
+agents" in `akira-board who` (zero edits, long `started_age_seconds`, `files: (none yet)`).
+- **Interim mitigation:** `akira-board block <epic-id>` — blocked cards aren't dispatched regardless of assignee (reassigning `coder → host` does NOT hold; a live `claim_lock` + the default_assignee rule revert it synchronously). Block the **epic** only, not its leaf children (leaves are legit coder work).
+- **Durable fix** lives in the **dispatcher** (remote board container, not any local repo): skip `route.kind == "epic"` (and any card with children) in auto-dispatch/claim, don't set `goal_mode` on epics, add a no-progress watchdog.
+
+## Handing work to an agent in ANOTHER repo (cross-repo handoff)
+The board is **one shared board**; a repo is just the card's route `repo:` slug. So to hand work to an
+agent working a *different* repo, route a card **to their slug** — do NOT drop a marker file in their
+repo (no status, no notification, no `wait`). Use the `handoff` verb:
+
+```powershell
+akira-board handoff "Optimize ML-KEM NTT" -To libq -Body "context + where to look; what's already landed"
+```
+
+It validates `-To` against the repo registry (a typo'd slug is rejected, so a card can't vanish into a
+repo no one syncs), writes the canonical route block (with `source` / `handoff_from` provenance), and
+returns the card id. The receiving agent sees it in their `akira-board sync`; you **track it from your
+side** with `akira-board wait <id>` (prints their summary when done). Add `-Parent <id>` to gate your
+own follow-up card on the handoff completing.
+
+## Waiting on another agent's card (runtime pause)
+If your work depends on a card another agent is finishing, you can **block until it completes** instead
+of polling by hand. A host agent acts via shell calls, so this blocking call *is* the pause:
+
+```powershell
+akira-board wait <card-id>                          # blocks until that card is done (30-min default)
+akira-board wait <id-a> <id-b> -Any -TimeoutSec 600 # unblock as soon as the FIRST of several finishes
+```
+
+It polls read-only (never touches the DB) and prints each finished card's summary so you get the
+upstream result inline. Exit code: `0` done · `2` dead-end (the card got blocked/archived — it won't
+self-complete, so stop waiting) · `3` timed out. Prefer structural gating (`create ... -Parent <id>`)
+when you can decompose upfront; use `wait` for an already-running dependency you must pause on.
 
 ## If something breaks unexpectedly — check for another agent FIRST
 Multiple agents (host Claude/Cursor sessions AND Hermes workers) may be working this repo at the
@@ -83,9 +185,22 @@ files blind. Your own presence (and the files you edit) is posted automatically 
 akira-board blame path/to/file      # "agent Y (focus: ...) edited this 2m ago"
 ```
 
-If `blame` names another agent, that change is theirs, not stray corruption — don't try to "fix"
-or revert it. You'll also get an **automatic warning** before you edit a file another live agent
-is working in (injected by a PreToolUse hook) — heed it.
+Read the result carefully — it distinguishes **live** from **historical**:
+
+- If `blame` shows an edit whose **session is LIVE**, that change is an active owner's — don't
+  "fix" or revert it; coordinate instead.
+- If the only edits are from **ENDED sessions** (or `blame` shows none), the change is **historical**
+  — a cold uncommitted edit from a session that's gone. That is NOT active ownership: an uncommitted
+  change sitting untouched is exactly the kind of thing you may need to evaluate, commit, or revert.
+  Don't assume "uncommitted ⇒ another agent is actively advancing it" — check liveness first (and
+  the file's mtime / `git log`), don't infer a live owner from the mere existence of a diff.
+- `blame` merges TWO sources: the hook log (Claude Code only) **and** git ground truth (which covers
+  Cursor, Hermes workers, and manual/terminal edits too). So an uncommitted change with no hook row
+  still shows up — read the git section: `UNCOMMITTED ... no LIVE session owns it` means historical/
+  abandoned (safe to evaluate/commit/revert), while `a LIVE session owns this` means coordinate.
+
+You'll also get an **automatic warning** before you edit a file another *live* agent is working in
+(injected by a PreToolUse hook) — heed it.
 
 # wello project rules (for any agent working in this repo)
 

@@ -4,8 +4,29 @@
       {
         "hooks": [
           {
-            "type": "command",
-            "command": "akira-board-hook PostToolUse"
+            "command": "akira-board-hook PostToolUse",
+            "type": "command"
+          }
+        ],
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit"
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "command": "akira-board-hook SessionStart",
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "akira-board-hook PreToolUse",
+            "type": "command"
           }
         ],
         "matcher": "Edit|Write|MultiEdit|NotebookEdit"
@@ -15,31 +36,10 @@
       {
         "hooks": [
           {
-            "type": "command",
-            "command": "akira-board-hook Stop"
+            "command": "akira-board-hook Stop",
+            "type": "command"
           }
         ]
-      }
-    ],
-    "SessionStart": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "akira-board-hook SessionStart"
-          }
-        ]
-      }
-    ],
-    "PreToolUse": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "akira-board-hook PreToolUse"
-          }
-        ],
-        "matcher": "Edit|Write|MultiEdit|NotebookEdit"
       }
     ]
   }
