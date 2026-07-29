@@ -45,13 +45,11 @@ If a card matches what you're about to do, claim it — pass your session id so 
 akira-board start <card-id> -Session <id>
 ```
 
-On `start`, the board auto-assembles a **context pack** for that card and prints it: the card + its
-parents' results, the nearest memory/code/experience (semantic retrieval), and any active model-bus
-health warnings — a just-enough brief so you begin informed instead of re-discovering what's known. It's
-best-effort (skipped if the model bus is down); disable with `AKIRA_CONTEXT_PACK=0`. You can also pull one
-on demand: `python tools/agents/context_pack.py --card <id>` or `--focus "<text>" --files <globs>`.
-Dispatched Hermes **workers** get the same brief as a one-time card comment when the operator enables
-`AKIRA_WORKER_CONTEXT_PACK=1` (posted by the host presence poller; off by default).
+On `start`, the board auto-assembles and prints a **context pack** for that card (card + parent
+results + nearest memory/code/experience + model-bus health) — best-effort; disable with
+`AKIRA_CONTEXT_PACK=0`, or pull one on demand: `python tools/agents/context_pack.py --card <id>`
+(or `--focus "<text>" --files <globs>`). Hermes workers get the same brief as a one-time card
+comment when the operator sets `AKIRA_WORKER_CONTEXT_PACK=1` (off by default).
 
 `akira-board sync` marks any card already being worked by a live agent in its `active` column —
 **don't pick up a card that already shows an owner there** unless you're collaborating.
@@ -72,14 +70,10 @@ If you're blocked: `akira-board block <card-id> -Reason "..."`. New work with no
 
 ## Finish clean — commit your work, don't leave branches/worktrees hanging
 **Once your work is green, commit it before you end the session.** Green means you actually ran
-the relevant tests/build and checked for regressions — not "it looks right".
-
-Every abandoned uncommitted diff becomes someone else's problem: the next agent finds a dirty tree
-it didn't create, can't tell finished work from a half-edit, and burns a chunk of its session
-working that out (see `blame`'s live-vs-historical distinction above — that ambiguity is exactly
-what this rule exists to prevent). A stale worktree also silently pins branches and disk.
-
-So, before you finish:
+the relevant tests/build and checked for regressions — not "it looks right". An abandoned
+uncommitted diff becomes the next agent's problem (dirty tree it didn't create, half-edit vs
+finished work — see `blame`'s live-vs-historical distinction), and a stale worktree silently pins
+branches and disk. Before you finish:
 
 ```powershell
 git status --short                  # nothing unexpected left behind?
@@ -125,6 +119,29 @@ akira-board ask "should we ship inc3 without the M1 runbook?"   # no card -> cre
 - `-Goal` marks a card as a goal (use for epics); idempotency keys make re-runs safe.
 - `akira-board show <id>` (human format) can throw a `ContainsKey null` formatter error → use `show <id> -Json`.
 - The bridge `health` verb reports "up" even when the backing **Docker** board container is down — in that state every read/write returns 502. Confirm with a real `list`, not `health`.
+
+## Card contract — what goes in a body (enforced at creation)
+Full spec + per-kind templates: akira repo `config/agents/card-contract.md` — read it before
+filing a non-trivial card. The wrapper **auto-stamps provenance** into the route block on
+`create`/`handoff` (`by`/`model`/`at`/`commit`/`session`) — never hand-write those; the `commit:`
+stamp is how readers detect staleness (card older than HEAD ⇒ re-verify before acting).
+
+- `kind:` must be one of `task|handoff|epic|decision|finding|bug|question` (default `task`;
+  unknown kinds are rejected at creation).
+- **The register rule.** Every factual claim is `OBSERVED:` (with `ev:` — the exact command and
+  its actual output; claim scope may not exceed evidence scope) or `SUSPECTED:` (an explicit
+  hypothesis + what would confirm it). Never write a suspicion in the assertive register.
+- `finding`/`bug`/`decision` cards **require** an `Evidence:` section and a `Not checked:` line
+  naming what you did NOT examine (`Not checked: none` only if exhaustive) — creation fails
+  without them. `task`/`handoff`: `Acceptance:` criteria must name a **verifiable artifact**
+  (exact command + expected result / counts) — never a bare "verify it".
+- **Premise-wrong is a first-class outcome**: `done -Summary "PREMISE-WRONG: <evidence>"` —
+  refuting a card with evidence is success, not failure.
+- **Corrections are append-only**: never edit a body to fix an error; post
+  `note <id> "CORRECTION: <what was wrong> — <evidence>"`. Newest CORRECTION beats the body.
+  Found a stale card? Comment `STALE as of <sha>: <what changed>` — stale ≠ wrong.
+- Cards without provenance stamps are **legacy**: readers tolerate them, treat the body as
+  SUSPECTED-at-unknown-date, and never retro-edit them.
 
 ## Epic cards + goal-mode dispatch hazard
 The dispatcher auto-assigns cards via `kanban.default_assignee` to the goal-mode `coder` worker. A
@@ -201,6 +218,67 @@ Read the result carefully — it distinguishes **live** from **historical**:
 
 You'll also get an **automatic warning** before you edit a file another *live* agent is working in
 (injected by a PreToolUse hook) — heed it.
+
+## Talking to other agents — GRC chat
+
+The board is for **work**: what needs doing, who owns it, what the outcome was. GRC (Grid Relay
+Chat) is for **conversation**: coordinating with another agent while you both work. They are
+complementary, and the `corr` tag ties them together — a GRC message tagged with a card id is
+archived under that card, so the discussion ends up attached to the work it was about.
+
+### When to use which
+
+- **Board** — anything that must survive and be acted on by someone who isn't here yet. Handoffs,
+  decisions, results, blockers. GRC is **not a mailbox**: a message only reaches agents who are
+  connected, so work parked in chat for an absent agent is work that gets lost.
+- **GRC** — live coordination with an agent who is working *right now*. Above all: **cross-repo
+  work on a shared card**, where you and the other agent are in different repos and would otherwise
+  never see each other.
+
+### Channels — derived, never invented
+
+```
+#card-<card-id>          the card you are working (e.g. #card-t_9b23872a)
+#repo-<canonical-slug>   your repo's ambient room (e.g. #repo-gip)
+#ops                     deploys, restarts, incidents
+#lobby                   presence / who is up
+```
+
+Repo slugs are the canonical ones from the repo registry — the same names the board routes on.
+**Never invent a channel name.** A channel nobody else joins is indistinguishable from a message
+you never sent.
+
+### The one rule that bites
+
+**JOIN a channel before you send to it.** GRC only retains a channel message if the sender was a
+member at send time. An unjoined send is accepted, acked, and silently discarded — you will be told
+it succeeded. The MCP tools join for you; if you use `grc-cli` directly, know that `send` joins the
+channel as of the 2026-07-28 fix, and older builds do not.
+
+### Working a card with agents in other repos
+
+Join your card's channel and say what you're taking, so the other side isn't guessing:
+
+```
+grc_join   #card-<id>
+grc_send   #card-<id>  "taking the <X> side in <repo>; will post when the interface settles"
+grc_peek   #card-<id>          # cheap unread digest — call this before grc_read
+```
+
+Tag messages with the card id (`corr`) so the archivist files the transcript under that card and it
+becomes part of the audit trail. Keep the durable conclusion on the **card** (`akira-board note`),
+not only in chat — chat is the working conversation, the card is the record.
+
+### After a context compaction
+
+If you have lost track of who you are or what you were doing, ask — it's a cheap, bounded call:
+
+```
+grc_whoami        # {nick, agent, repo, cardId, parentNick, channels, threads}
+```
+
+Your nick is deterministic (derived from agent + repo + session), so reconnecting restores the same
+identity, cursors and threads rather than stranding your history under a new name.
 
 # wello project rules (for any agent working in this repo)
 
