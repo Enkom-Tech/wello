@@ -85,6 +85,83 @@ function WriteUtf8([string]$p, [string]$text) {
   [System.IO.File]::WriteAllText($p, $text, (New-Object System.Text.UTF8Encoding($false)))
 }
 
+# --- deterministic JSON ---------------------------------------------------------------------
+# ConvertTo-Json's PRETTY-PRINTER differs between PowerShell engines, so regenerating under the
+# other one rewrote every managed config with no semantic change:
+#   5.1 -> 4-space indent, TWO spaces after the colon, keys SORTED alphabetically
+#   7.x -> 2-space indent, ONE space after the colon, INSERTION order preserved
+# The shims run pwsh and the scheduled tasks run powershell.exe, so both engines regenerate these
+# files in normal operation and the churn came back for whoever ran it next. -Compress IS
+# byte-identical across engines, so we take that as ground truth and do our own indenting.
+#
+# Sorting keys is deliberate: insertion order is an accident of how the object was built, and a
+# stable order means a real change to a managed config shows up as a real diff instead of being
+# buried in reflowed noise.
+function ConvertTo-SortedJsonInput($Value) {
+  if ($null -eq $Value) { return $null }
+  if ($Value -is [string] -or $Value -is [bool] -or $Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal]) {
+    return $Value
+  }
+  # Arrays keep their order - it is meaningful (argument lists, hook sequences).
+  if ($Value -is [System.Collections.IDictionary]) {
+    $out = [ordered]@{}
+    foreach ($k in @($Value.Keys | Sort-Object -CaseSensitive)) { $out[[string]$k] = ConvertTo-SortedJsonInput $Value[$k] }
+    return $out
+  }
+  if ($Value -is [System.Collections.IEnumerable]) {
+    # The unary comma is load-bearing. PowerShell unrolls a returned array, so a 1-element array
+    # comes back as a bare scalar and an EMPTY array comes back as nothing - which ConvertTo-Json
+    # then renders as "args": "x" and "args": {} instead of ["x"] and []. That silently rewrites
+    # .claude/settings.json's hook arrays into single objects, breaking every hook, and
+    # sync-agents.ps1 would propagate it to every repo. Caught by diffing the emitted JSON against
+    # HEAD rather than by trusting that reformatting is semantics-preserving.
+    $items = @(foreach ($item in $Value) { ConvertTo-SortedJsonInput $item })
+    return ,$items
+  }
+  if ($Value -is [psobject] -and $Value.PSObject.Properties) {
+    $out = [ordered]@{}
+    foreach ($p in @($Value.PSObject.Properties | Sort-Object -Property Name -CaseSensitive)) {
+      $out[$p.Name] = ConvertTo-SortedJsonInput $p.Value
+    }
+    return $out
+  }
+  return $Value
+}
+
+# Re-indent compact JSON with a two-space indent. String-aware: braces and brackets inside string
+# literals must not affect depth, and a backslash escape must not let a \" end the string.
+function Format-JsonDeterministic([string]$Compact) {
+  $sb = New-Object System.Text.StringBuilder
+  $depth = 0; $inStr = $false; $esc = $false
+  foreach ($ch in $Compact.ToCharArray()) {
+    if ($inStr) {
+      [void]$sb.Append($ch)
+      if ($esc) { $esc = $false }
+      elseif ($ch -eq '\') { $esc = $true }
+      elseif ($ch -eq '"') { $inStr = $false }
+      continue
+    }
+    switch ($ch) {
+      '"' { $inStr = $true; [void]$sb.Append($ch) }
+      '{' { $depth++; [void]$sb.Append($ch); [void]$sb.Append("`n"); [void]$sb.Append('  ' * $depth) }
+      '[' { $depth++; [void]$sb.Append($ch); [void]$sb.Append("`n"); [void]$sb.Append('  ' * $depth) }
+      '}' { $depth--; [void]$sb.Append("`n"); [void]$sb.Append('  ' * $depth); [void]$sb.Append($ch) }
+      ']' { $depth--; [void]$sb.Append("`n"); [void]$sb.Append('  ' * $depth); [void]$sb.Append($ch) }
+      ',' { [void]$sb.Append($ch); [void]$sb.Append("`n"); [void]$sb.Append('  ' * $depth) }
+      ':' { [void]$sb.Append(': ') }
+      default { [void]$sb.Append($ch) }
+    }
+  }
+  # Collapse the empty containers our naive walker expands ({\n} -> {}).
+  return ($sb.ToString() -replace '\{\s*\}', '{}' -replace '\[\s*\]', '[]')
+}
+
+# The only JSON writer this script should use for tracked files.
+function ToJsonStable($Value, [int]$Depth = 12) {
+  $compact = ConvertTo-SortedJsonInput $Value | ConvertTo-Json -Depth $Depth -Compress
+  return (Format-JsonDeterministic $compact)
+}
+
 $alwaysBodies = @()      # concatenated into the always-loaded Claude rules block
 $allBodies    = @()      # everything, in file order (AGENTS.md + Cursor)
 $scopedClaude = @()      # @{ Name; Paths; Body } -> separate path-scoped Claude rule files
@@ -211,7 +288,7 @@ if (-not $Check -and -not $cursorEnabled) {
         if ($cm['mcpServers'].Count -eq 0 -and $cm.Count -eq 1) {
           Remove-Item $cursorMcp -Force -ErrorAction SilentlyContinue
         } else {
-          WriteUtf8 $cursorMcp (($cm | ConvertTo-Json -Depth 12) + [Environment]::NewLine)
+          WriteUtf8 $cursorMcp ((ToJsonStable $cm 12) + [Environment]::NewLine)
         }
         Write-Host "  retired hermes-board MCP entry from .cursor/mcp.json" -ForegroundColor DarkGray
       }
@@ -256,14 +333,21 @@ function HookCmd([string]$e) {
   if (Test-Path $localHook) { "pwsh -NoProfile -File `"`$CLAUDE_PROJECT_DIR/scripts/agents/board-hook.ps1`" -Event $e" }
   else { "akira-board-hook $e" }
 }
+# The Bash guard is a SEPARATE PreToolUse group with its own matcher: board-hook tracks file edits
+# for the audit trail, danger-guard vets shell commands for blast radius. Different jobs, different
+# matchers, and merging them would mean one failing takes out the other.
+$guardCmd = "akira-danger-guard PreToolUse"
 $managed = [ordered]@{
   SessionStart = @{ hooks = @(@{ type='command'; command=(HookCmd 'SessionStart') }) }
-  PreToolUse   = @{ matcher='Edit|Write|MultiEdit|NotebookEdit'; hooks = @(@{ type='command'; command=(HookCmd 'PreToolUse') }) }
+  PreToolUse   = @(
+    @{ matcher='Edit|Write|MultiEdit|NotebookEdit'; hooks = @(@{ type='command'; command=(HookCmd 'PreToolUse') }) }
+    @{ matcher='Bash';                              hooks = @(@{ type='command'; command=$guardCmd }) }
+  )
   PostToolUse  = @{ matcher='Edit|Write|MultiEdit|NotebookEdit'; hooks = @(@{ type='command'; command=(HookCmd 'PostToolUse') }) }
   Stop         = @{ hooks = @(@{ type='command'; command=(HookCmd 'Stop') }) }
 }
-$ownRe  = 'board-hook'              # commands we currently own
-$dropRe  = 'board-hook|akira-board' # on regen, drop ours + any legacy `akira-board sync` hook
+$ownRe  = 'board-hook|danger-guard'              # commands we currently own
+$dropRe  = 'board-hook|akira-board|danger-guard' # on regen, drop ours + any legacy `akira-board sync` hook
 
 if ($Check) {
   $present = $true
@@ -285,7 +369,7 @@ if ($Check) {
   }
   $dir = Split-Path -Parent $settingsAbs
   if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
-  WriteUtf8 $settingsAbs (($s | ConvertTo-Json -Depth 12) + [Environment]::NewLine)
+  WriteUtf8 $settingsAbs ((ToJsonStable $s 12) + [Environment]::NewLine)
   Write-Host "  merged board hooks (SessionStart/PostToolUse/Stop) -> $settingsRel" -ForegroundColor DarkGray
 }
 
@@ -324,7 +408,7 @@ foreach ($rel in $mcpTargets.Keys) {
     }
     $dir = Split-Path -Parent $abs
     if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
-    WriteUtf8 $abs (($m | ConvertTo-Json -Depth 12) + [Environment]::NewLine)
+    WriteUtf8 $abs ((ToJsonStable $m 12) + [Environment]::NewLine)
     Write-Host "  mounted MCP servers -> $rel" -ForegroundColor DarkGray
   }
 }
@@ -353,5 +437,5 @@ if ($Check) {
   exit 0
 }
 
-WriteUtf8 $lockPath ((@{ generatedFrom = "repo:$repoSlug"; files = $lockEntries } | ConvertTo-Json -Depth 6) + [Environment]::NewLine)
+WriteUtf8 $lockPath ((ToJsonStable @{ generatedFrom = "repo:$repoSlug"; files = $lockEntries } 6) + [Environment]::NewLine)
 Write-Host "Generated agent config for repo '$repoSlug'. Lock written to .agents/agents.lock." -ForegroundColor Green

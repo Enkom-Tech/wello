@@ -25,12 +25,25 @@ session id the hook printed. Optionally reserve the files/globs you intend to ow
 akira-board working "<focus, e.g. BLE transport refactor>" -Session <id> -Files src/ble/*,src/transport.zig
 ```
 
+Reservations are matched as **wildcard patterns**, so `src/ble/*` covers every file under it — both
+in `akira-board who` and in the pre-edit hook that warns another agent off your files (and denies
+the edit outright when the operator sets `AKIRA_COORD_ENFORCE`).
+
+**Write paths the way your peers write them.** Matching is not separator- or root-aware:
+`src/x.zig`, `src\x.zig` and an absolute path are three different claims and do not match each
+other. Use repo-relative paths with forward slashes.
+
 Multiple agents in one repo is fine **as long as you're in different areas**. Before starting,
 check who else is here and what they're touching:
 
 ```powershell
-akira-board who                  # other agents' declared areas + files they've edited
+akira-board who                  # other agents' areas, reservations, and files they've edited
+akira-board who path/to/file     # ...and flag whether any of them overlaps these paths
 ```
+
+`who` reports two different file facts per agent and they call for different responses:
+`declared:` is what they reserved up front (they may not have started), `touched:` is what they
+have actually edited.
 
 If another agent's area/files overlap yours, coordinate or pick a different area. If they don't
 overlap, just proceed — parallel work in separate areas is expected.
@@ -116,6 +129,9 @@ akira-board ask "should we ship inc3 without the M1 runbook?"   # no card -> cre
 - `-Goal` marks a card as a goal (use for epics); idempotency keys make re-runs safe.
 - `akira-board show <id>` (human format) can throw a `ContainsKey null` formatter error → use `show <id> -Json`.
 - The bridge `health` verb reports "up" even when the backing **Docker** board container is down — in that state every read/write returns 502. Confirm with a real `list`, not `health`.
+- **Never pipe `akira-board` into `Select-Object -First N`** — or any short-circuiting cmdlet. PowerShell raises `StopUpstreamCommandsException`, which terminates **the akira-board process itself**, not just its output. `-First N` is not a display filter on an external command; it truncates the command. Observed twice in one session: it made a healthy `list` render as an **empty table** (which reads as "no cards", the exact false-negative the unknown-slug guard exists to prevent), and it killed a `create` *after* the card was filed but *before* cleanup ran. Use `| Out-String`, `-Last N`, or assign to a variable first — all of which consume the whole stream.
+- **A failed mutation no longer destroys your content.** `-Body`/`-BodyFile`/`-SummaryFile`/`-ReasonFile` content is copied to `data/agents/card-spool/` **before** the mutation is attempted. On failure the copy survives and the error prints its path plus a ready-made retry command. This exists because `akira-board` is an external shim: a failure sets `$LASTEXITCODE` but does **not** throw in your shell, so a `Remove-Item` on the next line of your script runs anyway and takes the only copy with it. Do not file-and-clean-up in one command — verify first, then clean.
+- **A surviving spool entry means "not known to have been filed", not "never filed".** A process killed after the write but before cleanup leaves one too. So always pass `-IdempotencyKey` on `create`/`handoff`: it is what makes retrying from the spool safe rather than a double-file.
 
 ## Card contract — what goes in a body (enforced at creation)
 Full spec + per-kind templates: akira repo `config/agents/card-contract.md` — read it before
@@ -128,10 +144,17 @@ stamp is how readers detect staleness (card older than HEAD ⇒ re-verify before
 - **The register rule.** Every factual claim is `OBSERVED:` (with `ev:` — the exact command and
   its actual output; claim scope may not exceed evidence scope) or `SUSPECTED:` (an explicit
   hypothesis + what would confirm it). Never write a suspicion in the assertive register.
+  Quote a tool's **own reported total** ("Checked 966 files; 11 errors") rather than a count you
+  re-derive from its output — a `grep -c` whose pattern misses one error class under-counts silently.
+- **A check you have not seen fail is not evidence.** Before reporting a gate as passing, run it
+  against input you know should match, or land the test red first and observe the failure. A command
+  that returns clean on every possible input proves nothing while looking rigorous — e.g. `git grep
+  "a|b"` (basic regex: `|` is literal, matches nothing) or `rg -rn <pat>` (`-r` is `--replace`).
 - `finding`/`bug`/`decision` cards **require** an `Evidence:` section and a `Not checked:` line
   naming what you did NOT examine (`Not checked: none` only if exhaustive) — creation fails
   without them. `task`/`handoff`: `Acceptance:` criteria must name a **verifiable artifact**
-  (exact command + expected result / counts) — never a bare "verify it".
+  (exact command + expected result / counts) and say how the check was shown to **fail** — never a
+  bare "verify it".
 - **Premise-wrong is a first-class outcome**: `done -Summary "PREMISE-WRONG: <evidence>"` —
   refuting a card with evidence is success, not failure.
 - **Corrections are append-only**: never edit a body to fix an error; post
@@ -276,3 +299,59 @@ grc_whoami        # {nick, agent, repo, cardId, parentNick, channels, threads}
 
 Your nick is deterministic (derived from agent + repo + session), so reconnecting restores the same
 identity, cursors and threads rather than stranding your history under a new name.
+
+## Spawning a subagent: give it Rule 0 and an incremental-write instruction
+
+A subagent can die mid-task — session limit, a server error, context exhaustion — with no warning
+and no notification to anything. **Nothing notifies a subagent of anything.** If its brief says
+"the build runs in the background and will notify me" or "I'll wait for the result", that premise
+is false: it must poll, check, or act — never sit idle waiting to be told.
+
+When any agent here (host session or subagent) spawns a subagent to do multi-step work, the brief
+you write for it MUST include both of the following, near the top, ahead of the task itself:
+
+```
+RULE 0 — STATELESS AND RESUMABLE. Do this before anything else.
+
+Your progress file: <scratchpad>/progress-<label>.md
+
+READ IT FIRST.
+  - Content means a previous instance of YOU was killed mid-task. Continue from where it stopped.
+    Do NOT restart, and do NOT redo work it records as done — verify cheaply and move on.
+  - Empty or missing means create it and start.
+
+APPEND after EVERY meaningful step — as you go, not at the end:
+    what you changed (file:line) / the exact command / its ACTUAL output / what you concluded /
+    what remains to do next
+Append only; never rewrite the file — an earlier entry you would overwrite may be the only record
+of something.
+
+Assume you will be terminated without warning. Your final return value is a SUMMARY of the
+progress file, not the only copy of your findings. Never wait idle for a notification — nothing
+will send you one.
+```
+
+This is one convention, not two: the progress file **is** the incremental deliverable. Write
+findings and conclusions into it as you reach them, not only file-edit bookkeeping — a subagent
+whose deliverable is a report, a design, or an investigation should treat each completed section as
+a "meaningful step" and append it before moving on. Don't keep a separate incremental-save
+instruction and a separate progress-file instruction; one file serves both jobs.
+
+**Stale vs. live, so a successor doesn't guess:** a progress file's last line tells you which.
+`## STATUS: DONE` / `## TASK COMPLETE` means the run finished — nothing to resume, its content is
+history. A line that names an in-progress step (`## RESULT 3/6: ...`, `## Status: STARTING`) with
+no newer completion line means the run that wrote it may still be alive or may be dead — check
+`akira-board who` / the orchestrator's agent-status view for a live session/task on that label
+before treating it as abandoned. Only once you've confirmed no live instance owns it should you
+resume from the last entry as a cold handoff.
+
+**Orchestrator-side obligations** (yours, not the subagent's, when you spawn or resume one):
+1. **Point a successor at the predecessor's progress file first** — hand it the path in the resume
+   prompt, before it re-derives anything.
+2. **Guard every pipeline stage against a null upstream result.** A stage whose input agent died
+   receives `null` (or an empty/absent deliverable file); a capable agent will improvise the
+   missing input rather than stop, which silently destroys whatever property the staging existed
+   to guarantee. Check the upstream artifact exists and looks substantive before feeding it
+   forward — fail loudly (`throw`) rather than pass through a placeholder.
+3. When resuming a subagent after a transient failure, **say so explicitly**: name the failure
+   cause if known, point at the progress file, and tell it to continue rather than restart.

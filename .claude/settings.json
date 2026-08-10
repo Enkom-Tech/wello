@@ -1,46 +1,55 @@
 {
-    "hooks":  {
-                  "PostToolUse":  [
-                                      {
-                                          "hooks":  [
-                                                        {
-                                                            "command":  "akira-board-hook PostToolUse",
-                                                            "type":  "command"
-                                                        }
-                                                    ],
-                                          "matcher":  "Edit|Write|MultiEdit|NotebookEdit"
-                                      }
-                                  ],
-                  "SessionStart":  [
-                                       {
-                                           "hooks":  [
-                                                         {
-                                                             "command":  "akira-board-hook SessionStart",
-                                                             "type":  "command"
-                                                         }
-                                                     ]
-                                       }
-                                   ],
-                  "PreToolUse":  [
-                                     {
-                                         "hooks":  [
-                                                       {
-                                                           "command":  "akira-board-hook PreToolUse",
-                                                           "type":  "command"
-                                                       }
-                                                   ],
-                                         "matcher":  "Edit|Write|MultiEdit|NotebookEdit"
-                                     }
-                                 ],
-                  "Stop":  [
-                               {
-                                   "hooks":  [
-                                                 {
-                                                     "command":  "akira-board-hook Stop",
-                                                     "type":  "command"
-                                                 }
-                                             ]
-                               }
-                           ]
-              }
+  "hooks": {
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "akira-board-hook PostToolUse",
+            "type": "command"
+          }
+        ],
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit"
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "akira-board-hook PreToolUse",
+            "type": "command"
+          }
+        ],
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit"
+      },
+      {
+        "hooks": [
+          {
+            "command": "akira-danger-guard PreToolUse",
+            "type": "command"
+          }
+        ],
+        "matcher": "Bash"
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "command": "akira-board-hook SessionStart",
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "command": "akira-board-hook Stop",
+            "type": "command"
+          }
+        ]
+      }
+    ]
+  }
 }

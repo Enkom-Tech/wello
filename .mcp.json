@@ -1,16 +1,12 @@
 {
-    "mcpServers":  {
-                       "hermes-board":  {
-                                            "args":  [
-
-                                                     ],
-                                            "command":  "akira-mcp-board"
-                                        },
-                       "grc-chat":  {
-                                        "args":  [
-
-                                                 ],
-                                        "command":  "akira-mcp-grc"
-                                    }
-                   }
+  "mcpServers": {
+    "grc-chat": {
+      "args": [],
+      "command": "akira-mcp-grc"
+    },
+    "hermes-board": {
+      "args": [],
+      "command": "akira-mcp-board"
+    }
+  }
 }
